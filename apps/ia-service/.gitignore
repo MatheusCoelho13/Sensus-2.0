@@ -37,3 +37,7 @@ output/
 *.tar
 *.gz
 tmp/
+
+# Dataset COCO gerado por `make dataset` (re-baixável)
+datasets/
+data/coco_raw/
