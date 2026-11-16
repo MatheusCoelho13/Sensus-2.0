@@ -43,13 +43,13 @@ The backend MUST:
 Required stack:
 
 ```txt
-Java 21
-Spring Boot
-Spring WebFlux
-Spring WebSocket
-PostgreSQL
+Node.js 22
+TypeScript
+Fastify
+@fastify/websocket (ws)
+zod
+PostgreSQL (pg)
 Redis
-Maven
 ```
 
 ---
@@ -76,23 +76,24 @@ Blocking operations MUST be avoided in websocket flow.
 
 # Package Organization
 
-Recommended package structure:
+Current layout (flat, one file per concern):
 
 ```txt
-src/main/java/com/sensus/backend/
-├── config/
-├── controller/
-├── websocket/
-├── dto/
-├── integration/
-├── service/
-├── repository/
-├── model/
-├── mapper/
-├── validation/
-├── exception/
-├── metrics/
-└── security/
+apps/backend-api/
+├── src/
+│   ├── server.ts           # bootstrap, graceful shutdown
+│   ├── app.ts              # Fastify routes + /ws/realtime
+│   ├── ws-handler.ts       # transport-agnostic realtime pipeline
+│   ├── analise-service.ts  # filter / sort / persist
+│   ├── ia-client.ts        # HTTP client for ia-service
+│   ├── rate-limiter.ts
+│   ├── repository.ts       # pg
+│   ├── migrate.ts          # SQL migration runner
+│   ├── tts.ts              # ElevenLabs
+│   ├── config.ts
+│   └── types.ts
+├── migrations/             # V<n>__*.sql
+└── test/                   # vitest
 ```
 
 ---
@@ -446,7 +447,6 @@ Backend MUST:
 Required variables:
 
 ```txt
-SPRING_PROFILES_ACTIVE
 DATABASE_URL
 REDIS_URL
 AI_SERVICE_URL
