@@ -32,7 +32,8 @@ except Exception:  # noqa: BLE001 - sem matplotlib só não gera o gráfico
 from ultralytics import YOLO
 
 DEFAULT_RUN_NAME = 'train_iter'
-STOP = {'asked': False, 'goal': False}
+STOP = {'asked': False, 'goal': False, 't': 0.0}
+ABORT_DEBOUNCE = 10  # s: 2º sinal dentro deste prazo é ignorado
 
 
 def stop_reason(asked: bool, goal: bool, done: int, total: int) -> str:
@@ -52,9 +53,12 @@ def explain_stop(reason: str, done: int, total: int, patience: int, target: floa
 
 def _ask_stop(signum, frame):
     """q / Ctrl+C: termina a época atual e salva best.pt/last.pt (2ª vez = aborta na hora)."""
+    now = time.monotonic()
     if STOP['asked']:
-        raise KeyboardInterrupt
-    STOP['asked'] = True
+        if now - STOP['t'] > ABORT_DEBOUNCE:  # sinal repetido logo após o 1º (duplo clique, Ctrl+C + SIGTERM) não aborta
+            raise KeyboardInterrupt
+        return
+    STOP['asked'], STOP['t'] = True, now
     print('🛑 parada pedida: terminando a época e salvando best.pt/last.pt… (de novo = abortar)')
 
 

@@ -151,7 +151,7 @@ def stop():
     """SIGTERM: o train.py termina a época e salva best.pt/last.pt. Se não sair em STOP_GRACE s, SIGKILL."""
     with lock:
         if running():
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.kill(proc.pid, signal.SIGTERM)  # só o processo principal: killpg matava os workers do DataLoader junto
             t = threading.Timer(STOP_GRACE, kill)
             t.daemon = True
             t.start()
