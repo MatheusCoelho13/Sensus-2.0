@@ -62,3 +62,16 @@ def test_write_report_end_to_end(tmp_path):
     data = json.loads((out.parent / 'relatorio.json').read_text())
     assert data['names'] == NAMES and data['classes'][0]['tp'] == 80 and data['classes'][2]['ap50'] == .7
     assert data['summary']['map50'] == .61
+
+
+def test_report_embeds_run_images(tmp_path):
+    png = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082')
+    (tmp_path / 'results.png').write_bytes(png)
+    (tmp_path / 'val_batch0_pred.jpg').write_bytes(b'\xff\xd8\xff\xd9')
+    imgs = report.collect_images(tmp_path, None)
+    assert [p.name for _, p in imgs] == ['results.png', 'val_batch0_pred.jpg']        # ordem fixa, só as que existem
+    page = report.render_html(dict(map50=.5, map5095=.3, precision=.6, recall=.7), M, NAMES, report.per_class(M, NAMES),
+                              dict(weights='w', data='d', imgsz=640, conf=.25, when='x'), imgs)
+    assert page.count('<figure>') == 2 and 'data:image/png;base64,' in page and 'imagens deste treino' in page
+    assert 'imagens deste treino' not in report.render_html(dict(map50=.5, map5095=.3, precision=.6, recall=.7), M, NAMES,
+                                                            report.per_class(M, NAMES), dict(weights='w', data='d', imgsz=640, conf=.25, when='x'))

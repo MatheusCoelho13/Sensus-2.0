@@ -22,10 +22,32 @@ from pathlib import Path
 
 import torch
 import yaml
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+except Exception:  # noqa: BLE001 - sem matplotlib só não gera o gráfico
+    plt = None
 from ultralytics import YOLO
 
 DEFAULT_RUN_NAME = 'train_iter'
-STOP = {'asked': False}
+STOP = {'asked': False, 'goal': False}
+
+
+def stop_reason(asked: bool, goal: bool, done: int, total: int) -> str:
+    return 'stopped' if asked else 'goal' if goal else 'epochs' if done >= total else 'patience'
+
+
+def explain_stop(reason: str, done: int, total: int, patience: int, target: float) -> str:
+    """Por que o treino terminou, em português claro (os painéis mostram este texto)."""
+    return {
+        'epochs': f'Rodou as {total} épocas pedidas até o fim.',
+        'goal': f'Parou na época {done} de {total}: o mAP50 chegou ao alvo de {target:.2f}. Para treinar mais, suba o alvo (--target-map).',
+        'patience': f'Parou na época {done} de {total}: {patience} épocas seguidas sem melhorar (patience). O modelo parou de evoluir; '
+                    f'aumente --patience para insistir mais.',
+        'stopped': f'Você parou o treino na época {done} de {total}. Os pesos ficaram salvos em best.pt e last.pt.',
+    }[reason]
 
 
 def _ask_stop(signum, frame):
@@ -153,6 +175,16 @@ def find_start_weight(project_root: Path, default: str) -> str:
     return str(max(cands, key=lambda p: p.stat().st_mtime)) if cands else default
 
 
+def ckpt_info(path):
+    """Última estatística gravada no .pt de treino do Ultralytics (train_metrics: mAP50 do melhor epoch), ou None."""
+    try:
+        ck = torch.load(str(path), map_location='cpu', weights_only=False)  # arquivo local do próprio projeto
+        m50 = (ck.get('train_metrics') or {}).get('metrics/mAP50(B)')
+        return {'map50': float(m50)} if m50 is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def class_weights_from_data(data_yaml: str):
     """weight[i] = total / (nc * count_i); classe sem anotação -> 1.0. None se não há labels."""
     data = yaml.safe_load(Path(data_yaml).read_text())
@@ -183,6 +215,29 @@ def emit(path: str, **ev):
     if path:
         with open(path, 'a', encoding='utf-8') as f:
             f.write(json.dumps({**ev, 't': time.time()}) + '\n')
+
+
+def save_epoch_plot(run_dir, history):
+    """epoch_metrics.json + epoch_metrics.png (precisão, recall e mAP50 por época), atualizados a cada época."""
+    run_dir = Path(run_dir)
+    (run_dir / 'epoch_metrics.json').write_text(json.dumps(history, indent=1), encoding='utf-8')
+    if plt is None or not history:
+        return None
+    xs = [h['epoch'] for h in history]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for key, label, mk in (('precision', 'precisão', 'o'), ('recall', 'recall', 's'), ('map50', 'mAP50', 'x')):
+        ax.plot(xs, [h.get(key) or 0 for h in history], marker=mk, label=label)
+    ax.set_xlabel('época')
+    ax.set_ylabel('valor (0 a 1)')
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=.3)
+    ax.legend()
+    ax.set_title('Precisão, recall e mAP50 por época')
+    fig.tight_layout()
+    out = run_dir / 'epoch_metrics.png'
+    fig.savefig(out)
+    plt.close(fig)
+    return out
 
 
 def first_layer_filters(trainer, prev=None):
@@ -223,17 +278,24 @@ def safe(fn):
     return wrapped
 
 
-def make_callbacks(target_map: float, cls_weights, events: str = ''):
+def make_callbacks(target_map: float, cls_weights, events: str = '', baseline=None, resumed=None, patience=None):
     """Callbacks que mostram o aprendizado acontecendo + aplicam peso de classe + early-stop."""
-    state = {'prev': None}
+    goal_on = not (baseline and baseline >= target_map)   # alvo já superado na partida: ignorá-lo (senão pararia na 1ª época)
+    state = {'prev': None, 'map50': baseline if baseline and baseline > 0 else None}   # 1ª época já é comparada ao ponto de partida
 
     def snapshot(trainer):
         return [p.detach().float().cpu().clone() for p in trainer.model.parameters()]
 
     def on_train_start(trainer):
         state['prev'] = snapshot(trainer)
+        print(f'📁 Run em {trainer.save_dir} — best.pt e last.pt são gravados em weights/ a cada época')
         filt, state['w1'] = first_layer_filters(trainer)
-        emit(events, type='start', epochs=trainer.epochs, device=str(trainer.device), target=target_map, filters=filt)
+        emit(events, type='start', epochs=trainer.epochs, device=str(trainer.device), target=target_map, filters=filt,
+             baseline=baseline, resumed_from=resumed, patience=patience, goal_on=goal_on,
+             run_dir=str(trainer.save_dir))
+        if not goal_on:
+            print(f'ℹ️ alvo {target_map:.2f} já superado pelo ponto de partida (mAP50 {baseline:.3f}): o treino roda até acabarem as épocas '
+                  f'ou até {patience} épocas sem melhorar. Suba --target-map para parar antes.')
         if cls_weights:
             # Ultralytics não tem arg 'class_weights': injeta no BCE da loss de classificação.
             # (BCEWithLogitsLoss.weight shape (nc,) faz broadcast sobre (batch, anchors, nc).)
@@ -277,7 +339,11 @@ def make_callbacks(target_map: float, cls_weights, events: str = ''):
              map50=map50, map5095=m.get('metrics/mAP50-95(B)'), precision=m.get('metrics/precision(B)'),
              recall=m.get('metrics/recall(B)'), loss=state.get('loss', {}), delta=state.get('delta'),
              delta_pct=state.get('delta_pct'), filters=filt)
-        if map50 >= target_map:
+        state.setdefault('hist', []).append(dict(epoch=trainer.epoch + 1, map50=map50, precision=m.get('metrics/precision(B)'),
+                                                 recall=m.get('metrics/recall(B)'), map5095=m.get('metrics/mAP50-95(B)')))
+        save_epoch_plot(trainer.save_dir, state['hist'])
+        if goal_on and map50 >= target_map:
+            STOP['goal'] = True
             print(f'✅ mAP50 {map50:.3f} >= {target_map:.3f} — parando')
             emit(events, type='goal', map50=map50)
             trainer.stop = True
@@ -305,25 +371,43 @@ def main():
 
     start = args.model or find_start_weight(root, 'yolov8s.pt')
     print(f'🔁 Ponto de partida: {start}')
+    info = ckpt_info(start)
+    continuing = info is not None and Path(start).name in ('best.pt', 'last.pt')   # modelo já treinado por nós
+    if continuing:
+        print(f'📊 Última estatística gravada nele: mAP50 = {info["map50"]:.3f} — o treino parte daí para melhorar')
     model = YOLO(start)
-    for event, fn in make_callbacks(args.target_map, cls_weights, args.events).items():
-        model.add_callback(event, fn)
 
     best_pt = root / 'models' / 'best.pt'
     baseline = -1.0
-    if best_pt.exists() and not args.skip_validate:
+    if best_pt.exists() and not args.skip_validate:   # revalida nos dados atuais: é o número a superar
         baseline = validate(best_pt, args.data, args.imgsz, val_batch, device, args.fast_validate)
         print(f'📌 baseline mAP50 = {baseline:.3f}')
+    seed = baseline if baseline >= 0 else (info or {}).get('map50')
+    for event, fn in make_callbacks(args.target_map, cls_weights, args.events, baseline=seed,
+                                    resumed=start if continuing else None, patience=args.patience).items():
+        model.add_callback(event, fn)
 
     kwargs = dict(data=args.data, epochs=args.max_epochs, imgsz=args.imgsz, batch=train_batch,
                   device=device, name=args.run_name, exist_ok=True, patience=args.patience,
                   cos_lr=True, freeze=args.freeze or None, close_mosaic=10,
                   cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=resolve_workers(args.workers))
-    if args.lr0:
+    if continuing:  # refinar modelo já treinado: LR baixo e warmup curto, p/ não "esquecer" o que já aprendeu
+        kwargs.update(optimizer='AdamW', lr0=args.lr0 or 0.0005, warmup_epochs=1.0)
+        print(f'🎯 Refinando modelo treinado: AdamW lr0={kwargs["lr0"]} (mude com --lr0)')
+    elif args.lr0:
         kwargs['lr0'] = args.lr0
+    print(f'📅 {args.max_epochs} épocas pedidas · para antes se mAP50 ≥ {args.target_map:.2f} ou {args.patience} épocas sem melhorar')
     model.train(**kwargs)
+    tr = model.trainer
+    done, total = tr.epoch + 1, tr.epochs
+    reason = stop_reason(STOP['asked'], STOP['goal'], done, total)
+    why = explain_stop(reason, done, total, args.patience, args.target_map)
+    print(f'🏁 {why}')
+    emit(args.events, type='end', reason=reason, epochs_done=done, epochs_total=total, text=why)
+    wdir = Path(tr.save_dir) / 'weights'   # confere (e mostra) o que realmente foi salvo
+    print('💾 ' + ' · '.join(f'{n} ' + (f'OK ({(wdir / n).stat().st_size / 1e6:.1f} MB)' if (wdir / n).exists() else 'NÃO GERADO')
+                             for n in ('best.pt', 'last.pt')) + f'  em {wdir}')
     if STOP['asked']:  # parado pelo usuário: pesos já salvos pelo Ultralytics; pula validação/relatório (demoram)
-        wdir = Path(model.trainer.save_dir) / 'weights'
         print(f'🛑 treino parado. Pesos salvos em {wdir} (best.pt e last.pt)')
         emit(args.events, type='stopped', path=str(wdir))
         return
@@ -341,7 +425,8 @@ def main():
         print(f'📦 models/best.pt atualizado (mAP50={new:.3f})')
     try:  # relatório com matriz de confusão (geral e por classe); nunca derruba o fim do treino
         from report import write_report
-        rep = write_report(run_best, args.data, root / 'runs' / 'report', args.imgsz, val_batch, device, map_metrics=mm)
+        rep = write_report(run_best, args.data, root / 'runs' / 'report', args.imgsz, val_batch, device, map_metrics=mm,
+                           run_dir=Path(tr.save_dir))
         print(f'📄 Relatório com matriz de confusão: {rep}')
         emit(args.events, type='report', path=str(rep))
     except Exception as e:  # noqa: BLE001

@@ -31,6 +31,63 @@ proc: 'subprocess.Popen | None' = None
 last_cmd = ''
 
 
+def run_dir(events=None) -> Path:
+    """Pasta do run atual: a do último evento 'start' (o train.py informa), senão runs/detect/train_iter."""
+    for e in reversed(events or []):
+        if e.get('type') == 'start' and e.get('run_dir'):
+            return Path(e['run_dir'])
+    return ROOT / 'runs' / 'detect' / 'train_iter'
+
+
+def list_images(events=None) -> list:
+    from report import IMAGES   # mesma lista/legendas do relatório
+    d, seen, out = run_dir(events), set(), []
+    for n, c in IMAGES:
+        if (d / n).exists() and c not in seen:   # variantes (Box...) têm a mesma legenda: mostra só a que existe
+            seen.add(c)
+            out.append(dict(name=n, caption=c, v=int((d / n).stat().st_mtime)))
+    return out
+
+
+def list_files(events=None) -> list:
+    """Arquivos que o run deixa na pasta: pesos (best/last), métricas e argumentos."""
+    d = run_dir(events)
+    out = []
+    for rel in ('weights/best.pt', 'weights/last.pt', 'results.csv', 'args.yaml'):
+        p = d / rel
+        if p.exists():
+            try:
+                shown = str(p.relative_to(ROOT))
+            except ValueError:
+                shown = str(p)
+            out.append(dict(name=rel, size=p.stat().st_size, path=shown))
+    return out
+
+
+def image_path(name: str, events=None):
+    """Só serve arquivos da lista IMAGES (sem path traversal)."""
+    from report import IMAGES
+    p = run_dir(events) / name
+    return p if name in {n for n, _ in IMAGES} and p.exists() else None
+
+
+def write_gallery() -> 'Path | None':
+    """HTML simples com as imagens do run (links file://) — o TUI abre isto no navegador (tecla i)."""
+    import html as _h
+    imgs = list_images(read_events())
+    if not imgs:
+        return None
+    d = run_dir(read_events())
+    files = ''.join(f'<li>{_h.escape(f["path"])} ({f["size"] / 1e6:.1f} MB)</li>' for f in list_files(read_events()))
+    figs = ''.join(f'<figure><img src="{(d / i["name"]).as_uri()}" style="max-width:100%"><figcaption>{_h.escape(i["caption"])}</figcaption></figure>' for i in imgs)
+    out = RUN_DIR / 'galeria.html'
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    out.write_text('<!doctype html><meta charset="utf-8"><title>Imagens do treino</title>'
+                   '<body style="background:#0d0c0a;color:#ece6d4;font:14px monospace;max-width:1100px;margin:auto;padding:16px">'
+                   f'<h2>Arquivos do run</h2><ul>{files}</ul><h2>Imagens do treino</h2>{figs}</body>', encoding='utf-8')
+    return out
+
+
 def list_models() -> list:
     """Todo .pt dentro de models/ (best.pt primeiro). Atualiza a cada poll: basta soltar o arquivo lá."""
     found = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / 'models').glob('*.pt'))
@@ -55,7 +112,7 @@ def validate(body: dict) -> dict:
     if not re.fullmatch(r'[\w ./-]+\.pt', model) or '..' in model or model.startswith('/'):
         raise ValueError('model deve ser um caminho relativo .pt (ex: models/yolov8n.pt)')
     return dict(target=num('target', float, 0.05, 0.99, 0.6), epochs=num('max_epochs', int, 1, 1000, 300),
-                imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 0, 128, 0), ram_gb=num('ram_gb', float, 0, 1024, 0),
+                imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 0, 128, 0), ram_gb=num('ram_gb', float, 0, 1024, 0), patience=num('patience', int, 1, 1000, DEFAULT_PATIENCE),
                 vram_gb=num('vram_gb', float, 0, 256, 0), model=model)
 
 
@@ -70,7 +127,7 @@ def start(body: dict):
         py = sys.executable
         train = [py, 'scripts/train.py', '--data', 'config/data.yaml', '--model', a['model'], '--imgsz', str(a['imgsz']),
                  '--batch', str(a['batch']), '--cls-weight', 'auto', '--max-epochs', str(a['epochs']),
-                 '--patience', '100', '--target-map', str(a['target']), '--events', str(EVENTS),
+                 '--patience', str(a['patience']), '--target-map', str(a['target']), '--events', str(EVENTS),
                  '--ram-gb', str(a['ram_gb']), '--vram-gb', str(a['vram_gb'])]
         cmd = 'exec ' + shlex.join(train)   # exec: o pid do subprocesso passa a ser o do python
         if not DATASET.exists():  # baixa/balanceia o COCO antes se ainda não existe
@@ -81,6 +138,7 @@ def start(body: dict):
                                 start_new_session=True, env={**os.environ, 'PYTHONUNBUFFERED': '1'})
 
 
+DEFAULT_PATIENCE = 100  # épocas sem melhorar antes do treino parar sozinho
 STOP_GRACE = 180  # s p/ o treino salvar os pesos antes de ser morto à força
 
 
@@ -123,8 +181,9 @@ def read_log(n: int = 60) -> list:
 
 
 def state() -> dict:
+    ev = read_events()
     return dict(running=running(), exit_code=None if proc is None or running() else proc.returncode,
-                dataset_ready=DATASET.exists(), report_ready=REPORT.exists(), models=list_models(), events=read_events(), log=read_log())
+                dataset_ready=DATASET.exists(), report_ready=REPORT.exists(), models=list_models(), events=ev, images=list_images(ev), files=list_files(ev), run_dir=str(run_dir(ev)), log=read_log())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -147,6 +206,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             return self.wfile.write(data)
+        if self.path.startswith('/img/'):
+            p = image_path(self.path[5:].split('?')[0], read_events())
+            if p:
+                data = p.read_bytes()
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png' if p.suffix == '.png' else 'image/jpeg')
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('Cache-Control', 'no-cache')
+                self.end_headers()
+                return self.wfile.write(data)
         if self.path == '/relatorio' and REPORT.exists():
             data = REPORT.read_bytes()
             self.send_response(200)

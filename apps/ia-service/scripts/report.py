@@ -54,6 +54,52 @@ def verdict(s):
     return 'razoável', 'dim'
 
 
+# ---------------------------------------------------------------- imagens do run
+IMAGES = [  # (arquivo, legenda) — o que o Ultralytics e o train.py gravam na pasta do run
+    ('epoch_metrics.png', 'Evolução por época: precisão, recall e mAP50.'),
+    ('results.png', 'Todas as curvas do treino: erros (loss) e métricas por época.'),
+    ('confusion_matrix_normalized.png', 'Matriz de confusão em percentual por classe (versão do Ultralytics).'),
+    ('confusion_matrix.png', 'Matriz de confusão em contagem (versão do Ultralytics).'),
+    # o Ultralytics novo grava as curvas com prefixo "Box"; o antigo sem. Mesma legenda: só a que existir aparece.
+    ('BoxPR_curve.png', 'Curva precisão × recall de cada classe: quanto mais perto do canto superior direito, melhor.'),
+    ('PR_curve.png', 'Curva precisão × recall de cada classe: quanto mais perto do canto superior direito, melhor.'),
+    ('BoxF1_curve.png', 'F1 de cada classe conforme o limiar de confiança: o pico mostra o melhor limiar.'),
+    ('F1_curve.png', 'F1 de cada classe conforme o limiar de confiança: o pico mostra o melhor limiar.'),
+    ('BoxP_curve.png', 'Precisão conforme o limiar de confiança: subir o limiar reduz falsos alarmes.'),
+    ('P_curve.png', 'Precisão conforme o limiar de confiança: subir o limiar reduz falsos alarmes.'),
+    ('BoxR_curve.png', 'Recall conforme o limiar de confiança: subir o limiar faz a rede perder mais objetos.'),
+    ('R_curve.png', 'Recall conforme o limiar de confiança: subir o limiar faz a rede perder mais objetos.'),
+    ('labels.jpg', 'Distribuição dos rótulos do dataset: quantos objetos de cada classe e onde aparecem.'),
+    ('train_batch0.jpg', 'Exemplos do treino (já com aumento de dados: mosaico, cor, espelhamento).'),
+    ('train_batch1.jpg', 'Exemplos do treino (lote 2).'),
+    ('train_batch2.jpg', 'Exemplos do treino (lote 3).'),
+    ('val_batch0_labels.jpg', 'Validação: o que o humano marcou (gabarito).'),
+    ('val_batch0_pred.jpg', 'Validação: o que a rede previu nas mesmas imagens. Compare com o gabarito ao lado.'),
+    ('val_batch1_labels.jpg', 'Validação: gabarito (lote 2).'),
+    ('val_batch1_pred.jpg', 'Validação: previsões da rede (lote 2).'),
+]
+MAX_EMBED_MB = 1.5
+
+
+def collect_images(*dirs):
+    """[(legenda, caminho)] das imagens existentes, na ordem de IMAGES; a 1ª pasta que tiver o arquivo vence."""
+    out, seen = [], set()
+    for name, cap in IMAGES:
+        for d in dirs:
+            p = Path(d) / name if d else None
+            if p and p.exists() and cap not in seen and p.stat().st_size <= MAX_EMBED_MB * 1e6:
+                out.append((cap, p))
+                seen.add(cap)
+                break
+    return out
+
+
+def embed(path: Path) -> str:
+    import base64
+    mime = 'image/png' if path.suffix == '.png' else 'image/jpeg'
+    return f'data:{mime};base64,' + base64.b64encode(path.read_bytes()).decode()
+
+
 # ---------------------------------------------------------------- HTML
 CSS = """
 :root{--bg:#0d0c0a;--ink:#ece6d4;--dim:#8f8977;--rule:#2b2923;--reward:#c8ff2e;--punish:#ff4b2b;
@@ -84,6 +130,8 @@ background:color-mix(in srgb,var(--c) calc(var(--a)*100%),transparent);color:var
 .m2 b{display:block;font:italic 400 24px/1 var(--serif)}
 .bar{display:grid;grid-template-columns:78px 1fr 48px;gap:8px;align-items:center;font-size:12px;margin:3px 0}
 .bar i{display:block;height:5px;background:var(--rule)}.bar i u{display:block;height:100%;background:var(--ink);text-decoration:none}
+.gal{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:22px}.gal figure{border-top:1px solid var(--rule);padding-top:10px}
+.gal img{width:100%;display:block;background:#fff;border-radius:2px}.gal figcaption{color:var(--dim);font-size:12px;margin-top:6px}
 .note{margin-top:10px;color:var(--dim);font-size:12px}
 footer{border-top:1px solid var(--rule);padding-top:16px;color:var(--dim);font-size:12px;max-width:80ch}
 """
@@ -93,7 +141,7 @@ def pct(v):
     return '—' if v is None else f'{100 * v:.0f}%'
 
 
-def render_html(summary, matrix, names, classes, meta):
+def render_html(summary, matrix, names, classes, meta, images=()):
     esc, nc = html.escape, len(matrix) - 1
     labels = [esc(str(n)) for n in names]
 
@@ -143,6 +191,12 @@ def render_html(summary, matrix, names, classes, meta):
     stats = ''.join(f'<div><span class="label">{k}</span><b>{v}</b></div>' for k, v in (
         ('mAP50', f'{summary["map50"]:.3f}'), ('mAP50-95', f'{summary["map5095"]:.3f}'),
         ('precisão', f'{summary["precision"]:.3f}'), ('recall', f'{summary["recall"]:.3f}')))
+    gallery = ''
+    if images:
+        figs = ''.join(f'<figure><a href="{embed(p)}" target="_blank"><img src="{embed(p)}" alt="{esc(cap)}" loading="lazy"></a>'
+                       f'<figcaption>{esc(cap)}</figcaption></figure>' for cap, p in images)
+        gallery = ('<section><div class="label">imagens deste treino</div><p>As imagens que o treino gerou. Clique para ampliar. '
+                   'As de validação comparam o gabarito com o que a rede previu.</p>' f'<div class="gal">{figs}</div></section>')
     return f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sensus Lab · Relatório</title><style>{CSS}</style></head><body><div class="wrap">
 <header><b>SENSUS·LAB</b> <span class="label">relatório de avaliação</span><h1>Onde a rede acerta e onde erra</h1>
@@ -153,12 +207,12 @@ def render_html(summary, matrix, names, classes, meta):
 <section><div class="label">matriz de confusão · cada classe</div>
 <p>Para cada classe: quantos acertos, falsos alarmes e objetos perdidos, com precisão (dos que previu, quantos estavam certos) e recall (dos que existiam, quantos achou).</p>
 <div class="grid">{''.join(cards)}</div></section>
-<footer>Matriz calculada com confiança ≥ {meta['conf']} e IoU 0.5. Em detecção não há “verdadeiro negativo” (o fundo é infinito), por isso o quadro 2×2 de cada classe mostra só acertos, falsos alarmes e perdidos. mAP e precisão/recall do topo vêm de uma validação separada, com o limiar padrão do Ultralytics.</footer>
+{gallery}<footer>Matriz calculada com confiança ≥ {meta['conf']} e IoU 0.5. Em detecção não há “verdadeiro negativo” (o fundo é infinito), por isso o quadro 2×2 de cada classe mostra só acertos, falsos alarmes e perdidos. mAP e precisão/recall do topo vêm de uma validação separada, com o limiar padrão do Ultralytics.</footer>
 </div></body></html>"""
 
 
 # ---------------------------------------------------------------- execução
-def write_report(weights, data, out_root, imgsz=640, batch=16, device='0', conf=0.25, map_metrics=None):
+def write_report(weights, data, out_root, imgsz=640, batch=16, device='0', conf=0.25, map_metrics=None, run_dir=None):
     """Roda as validações e grava o relatório. Retorna o Path do HTML. `map_metrics`: validação já feita (evita repetir)."""
     from ultralytics import YOLO
     out_root = Path(out_root)
@@ -181,7 +235,8 @@ def write_report(weights, data, out_root, imgsz=640, batch=16, device='0', conf=
     summary = dict(map50=float(mm.box.map50), map5095=float(mm.box.map), precision=float(mm.box.mp), recall=float(mm.box.mr))
     meta = dict(weights=str(weights), data=str(data), imgsz=imgsz, conf=conf, when=time.strftime('%d/%m/%Y %H:%M'))
 
-    page = render_html(summary, matrix, names, classes, meta)
+    images = collect_images(run_dir, out_dir / 'ultralytics')   # imagens do treino; senão as da validação do relatório
+    page = render_html(summary, matrix, names, classes, meta, images)
     (out_dir / 'relatorio.html').write_text(page, encoding='utf-8')
     (out_dir / 'relatorio.json').write_text(json.dumps(
         dict(meta=meta, summary=summary, names=names, matrix_pred_x_real=matrix, classes=classes), indent=2, ensure_ascii=False), encoding='utf-8')

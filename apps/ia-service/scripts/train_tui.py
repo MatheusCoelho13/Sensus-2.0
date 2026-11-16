@@ -8,6 +8,7 @@ Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v 
 """
 import curses
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -23,7 +24,22 @@ GLYPH = {
     '.': ['  ', '  ', '  ', '██', '██'],
 }
 EIGHTHS = ' ▁▂▃▄▅▆▇█'
-EPOCH_CHOICES = [50, 100, 300, 600]
+CONFIG_KEYS = {ord(c) for c in 'eEbBrRvVmM+=-_'}
+HELP = [
+    ('ÉPOCAS (tecla e)', 'Quantas vezes a rede vê o conjunto de treino inteiro. Mais épocas = mais aprendizado e mais tempo. '
+                         'É um LIMITE: o treino pode parar antes (veja "quando para").'),
+    ('QUANDO PARA', '1) acabaram as épocas · 2) o mAP50 chegou ao alvo · 3) passaram 100 épocas seguidas sem melhorar (patience) · '
+                    '4) você apertou s ou q. Ao fim, o painel diz qual foi o motivo.'),
+    ('ALVO mAP50 (+/-)', 'Nota de 0 a 1 de quão bem a rede acha os objetos. Chegou nela, o treino encerra. Se o modelo de partida '
+                         '(best.pt) já passa do alvo, o alvo é ignorado e o treino segue até acabar as épocas.'),
+    ('BATCH (b)', 'Imagens processadas por vez. Maior = mais rápido, mas usa mais memória da GPU. "máx" ocupa 90% da VRAM.'),
+    ('RAM (r) / VRAM (v)', 'RAM: quanto de memória pode guardar as imagens em cache. VRAM: quanto da placa de vídeo o treino pode usar. '
+                           '"máx" = sem limite.'),
+    ('MODELO (m)', 'Ponto de partida. best.pt = continua do melhor treino já feito e tenta melhorar (taxa de aprendizado baixa).'),
+    ('▲ RECOMPENSA / ▼ PUNIÇÃO', 'O mAP50 subiu / caiu em relação à época anterior. A rede corrige os pesos a partir do erro (loss) '
+                                 'contra os rótulos: é aprendizado supervisionado.'),
+    ('IMPORTANTE', 'Mudar a configuração não afeta um treino em andamento: pare (s) e inicie de novo.'),
+]
 BATCH_CHOICES = [0, 4, 8, 16, 32, 64]   # 0 = máximo (ocupa a GPU)
 RAM_CHOICES = [0, 2, 4, 8, 16, 32]       # GB p/ cache de imagens; 0 = máximo (toda a RAM livre)
 VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]    # GB de GPU; 0 = máximo (a GPU inteira)
@@ -78,10 +94,11 @@ def spark(values: list, width: int) -> str:
 class UI:
     def __init__(self, scr):
         self.scr, self.msg, self.show_log = scr, '', False
-        self.target, self.epochs_i, self.model = 0.60, 2, ''
+        self.msg_until, self.show_help = 0.0, False
+        self.target, self.epochs, self.model = 0.60, 300, ''
         self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
         self.quitting = False
-        self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [], 'report_ready': False,
+        self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [], 'report_ready': False, 'files': [],
                                               'exit_code': None}, 0.0, {}
         curses.curs_set(0)
         curses.start_color()
@@ -135,7 +152,7 @@ class UI:
         """Cada neurônio = filtro 3×3 suavizado, desenhado com meio-bloco (▀: cor de cima + cor de baixo).
         Abaixo de cada um, uma barrinha mostra o quanto ele mudou nesta época."""
         k, tiles, delta = f['k'], f['tiles'], f.get('delta')
-        n, avail = len(tiles), h - 3 - y
+        n, avail = len(tiles), h - 4 - y
         rich = self.c256 and curses.COLOR_PAIRS >= 4096
         size = 8
         if rich:
@@ -150,7 +167,7 @@ class UI:
         dmax = max(delta or [0]) or 1e-12
         for i, t in enumerate(tiles):
             ty, tx = y + (i // per) * (th + 1), 2 + (i % per) * (tw + 1)
-            if ty + th + 1 > h - 2:
+            if ty + th + 1 > h - 3:
                 break
             if rich:
                 px, c = upscale(t, k, size), (size - 1) / 2
@@ -178,27 +195,63 @@ class UI:
             self.put(y, 2, f' {label} ', DIM)
 
     # ---------- ações ----------
+    def say(self, text, secs=6):
+        self.msg, self.msg_until = text, time.time() + secs
+
+    def ask_number(self, label, current, lo, hi):
+        """Digite o número na linha de baixo e Enter (Esc cancela)."""
+        h, w = self.scr.getmaxyx()
+        buf = ''
+        self.scr.timeout(-1)
+        try:
+            while True:
+                self.put(h - 2, 1, ' ' * (w - 3))
+                self.put(h - 2, 1, f'{label} ({lo}-{hi}, atual {current}): {buf}█   Enter confirma · Esc cancela', INK, True)
+                self.scr.refresh()
+                k = self.scr.getch()
+                if k in (10, 13, curses.KEY_ENTER):
+                    break
+                if k == 27:
+                    return current
+                if k in (curses.KEY_BACKSPACE, 127, 8):
+                    buf = buf[:-1]
+                elif 48 <= k <= 57 and len(buf) < 6:
+                    buf += chr(k)
+        finally:
+            self.scr.timeout(250)
+        if buf and lo <= int(buf) <= hi:
+            self.say(f'{label}: {int(buf)} (vale no próximo treino)')
+            return int(buf)
+        self.say(f'erro: {label} deve ser um número entre {lo} e {hi}')
+        return current
+
     def toggle(self):
         try:
             if self.S['running']:
                 core.stop()
-                self.msg = 'parando: terminando a época e salvando best.pt/last.pt…'
+                self.say('parando: terminando a época e salvando best.pt/last.pt…', 600)
             elif not self.model:
-                self.msg = 'erro: nenhum .pt em models/ — coloque um modelo lá'
+                self.say('erro: nenhum .pt em models/ — coloque um modelo lá')
             else:
-                core.start({'target': self.target, 'max_epochs': EPOCH_CHOICES[self.epochs_i], 'model': self.model,
+                core.start({'target': self.target, 'max_epochs': self.epochs, 'model': self.model,
                             'batch': BATCH_CHOICES[self.batch_i], 'ram_gb': RAM_CHOICES[self.ram_i],
                             'vram_gb': VRAM_CHOICES[self.vram_i]})
                 self.msg = ''
         except ValueError as e:
-            self.msg = f'erro: {e}'
+            self.say(f'erro: {e}')
 
     def key(self, k):
+        if k == ord('?'):
+            self.show_help = not self.show_help
+            return True
+        if self.S['running'] and k in CONFIG_KEYS:
+            self.say('erro: não dá pra mudar um treino em andamento — pare (s) e inicie de novo com a nova configuração')
+            return True
         if k in (ord('q'), ord('Q')):
             if self.S['running'] and not self.quitting:
                 core.stop()
                 self.quitting = True
-                self.msg = 'parando: terminando a época e salvando best.pt/last.pt… (q de novo força a saída)'
+                self.say('parando: terminando a época e salvando best.pt/last.pt… (q de novo força a saída)', 600)
                 return True
             core.kill()
             return False
@@ -209,7 +262,7 @@ class UI:
         elif k in (ord('-'), ord('_')):
             self.target = max(0.05, round(self.target - 0.05, 2))
         elif k in (ord('e'), ord('E')):
-            self.epochs_i = (self.epochs_i + 1) % len(EPOCH_CHOICES)
+            self.epochs = self.ask_number('épocas', self.epochs, 1, 1000)
         elif k in (ord('m'), ord('M')):
             ms = self.S['models']
             if ms:
@@ -224,9 +277,17 @@ class UI:
             if core.REPORT.exists():
                 import webbrowser
                 if not webbrowser.open(core.REPORT.as_uri()):
-                    self.msg = f'erro: sem navegador; abra {core.REPORT}'
+                    self.say(f'erro: sem navegador; abra {core.REPORT}')
             else:
-                self.msg = 'erro: ainda não há relatório (termine um treino ou rode make relatorio)'
+                self.say('erro: ainda não há relatório (termine um treino ou rode make relatorio)')
+        elif k in (ord('i'), ord('I')):
+            g = core.write_gallery()
+            if not g:
+                self.say('erro: ainda não há imagens (elas surgem na 1ª época do treino)')
+            else:
+                import webbrowser
+                if not webbrowser.open(g.as_uri()):
+                    self.say(f'erro: sem navegador; abra {g}')
         elif k in (ord('l'), ord('L')):
             self.show_log = not self.show_log
         return True
@@ -246,7 +307,7 @@ class UI:
         last = eps[-1] if eps else None
         goal = any(e['type'] == 'goal' for e in ev)
         target = start['target'] if start else self.target
-        total = (last or start or {}).get('epochs', EPOCH_CHOICES[self.epochs_i])
+        total = (last or start or {}).get('epochs', self.epochs)
 
         # cabeçalho
         led, lc = ('●', REWARD) if S['running'] else (('●', PUNISH) if (S['exit_code'] or 0) > 0 and not goal else ('●', DIM))
@@ -262,9 +323,12 @@ class UI:
         self.rule(1)
         if self.show_log:
             return self.log_view()
+        if self.show_help:
+            return self.help_view()
 
         # herói: dígitos grandes + veredito
-        m = last['map50'] if last else 0.0
+        base = (start or {}).get('baseline') or 0.0
+        m = last['map50'] if last else base
         v = last.get('verdict') if last else None
         dig_pair = INK if last else DIM
         for i, row in enumerate(digits_rows(m)):
@@ -278,14 +342,14 @@ class UI:
             self.put(5, 33, 'errou menos: pesos reforçados' if v == 'reward' else 'errou mais: gradiente corrige', DIM)
         else:
             self.put(3, 33, '—', DIM)
-            self.put(5, 33, 'aguardando 1ª época' if not last else 'sem variação', DIM)
+            self.put(5, 33, ('ponto de partida · melhorando o best.pt' if base else 'aguardando 1ª época') if not last else 'sem variação', DIM)
         nr, np_ = sum(e.get('verdict') == 'reward' for e in eps), sum(e.get('verdict') == 'punish' for e in eps)
         self.put(6, 33, f'▲ {nr}', REWARD, True)
         self.put(6, 41, f'▼ {np_}', PUNISH, True)
 
         ram, vram = RAM_CHOICES[self.ram_i], VRAM_CHOICES[self.vram_i]
         bs = BATCH_CHOICES[self.batch_i]
-        cfg = (f'épocas {EPOCH_CHOICES[self.epochs_i]} · batch {bs or "máx"} · '
+        cfg = (f'épocas {self.epochs} · batch {bs or "máx"} · '
                f'RAM {f"{ram}GB" if ram else "máx"} · VRAM {f"{vram}GB" if vram else "máx"} · '
                f'modelo {(self.model.split("/")[-1][:-3] or "—") if self.model else "—"}')
         self.put(7, 2, cfg, DIM)
@@ -356,27 +420,51 @@ class UI:
                              REWARD if vd == 'reward' else PUNISH if vd == 'punish' else DIM)
 
         # banner + log + rodapé
+        end = next((e for e in ev if e['type'] == 'end'), None)
         ban, bp = '', DIM
-        if (S['exit_code'] or 0) > 0 and not goal:
+        if (S['exit_code'] or 0) > 0 and not goal and not end:
             ban, bp = f'FALHOU (código {S["exit_code"]}): ' + ' · '.join(S['log'][-2:]), PUNISH
+        elif end:
+            ban, bp = end['text'], (REWARD if end['reason'] == 'goal' else DIM)
         elif goal:
             ban, bp = f'ALVO ATINGIDO: mAP50 {last["map50"]:.3f} ≥ {target:.2f}. Modelo em models/best.pt', REWARD
         elif S['running'] and not last:
             ban = 'Preparando… (pressione l para ver a saída do processo)'
         elif not S['running'] and not last and not S['dataset_ready']:
             ban = 'Dataset COCO não encontrado: será baixado e balanceado antes do treino.'
+        elif not S['running'] and not last:
+            ban = (f'Para quando: acabarem {self.epochs} épocas · ou mAP50 ≥ {self.target:.2f} · '
+                   f'ou {core.DEFAULT_PATIENCE} épocas sem melhorar  (? explica tudo)')
         if S.get('report_ready') and not S['running'] and not ban:
             ban = 'Relatório com matriz de confusão pronto: tecla o abre no navegador (runs/report/latest.html)'
-        if self.msg:
+        if self.msg and time.time() < self.msg_until:
             ban, bp = self.msg, PUNISH
+        files = S.get('files') or []
+        if files and not S['running']:
+            self.put(h - 3, 1, ('Arquivos do run: ' + ' · '.join(f'{f["name"]} {f["size"] / 1e6:.1f}MB' if f['size'] > 1e6 else f'{f["name"]}' for f in files)
+                                + f'  em {S.get("run_dir", "")}')[: w - 3], DIM)
         self.footer(ban, bp)
 
     def footer(self, ban='', bp=DIM):
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 1, ban[: w - 3], bp)
-        info = (f's {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · b batch · r RAM · '
-                f'v VRAM · m modelo · o relatório · l {"voltar" if self.show_log else "log"} · q sair')
+        info = (f'? ajuda · s {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · b batch · r RAM · '
+                f'v VRAM · m modelo · i imagens · o relatório · l {"voltar" if self.show_log else "log"} · q sair')
         self.put(h - 1, 1, info, DIM)
+
+    def help_view(self):
+        h, w = self.scr.getmaxyx()
+        self.rule(1, 'ajuda · o que é cada configuração (? volta)')
+        y = 3
+        for title, text in HELP:
+            self.put(y, 2, title, REWARD, True)
+            y += 1
+            for ln in textwrap.wrap(text, max(30, min(w - 6, 100))):
+                if y < h - 3:
+                    self.put(y, 4, ln, INK)
+                y += 1
+            y += 1
+        self.footer('', DIM)
 
     def log_view(self):
         h, w = self.scr.getmaxyx()
@@ -395,10 +483,8 @@ class UI:
                     return
                 if self.model not in self.S['models']:
                     self.model = self.S['models'][0] if self.S['models'] else ''
-                if self.S['running'] and self.msg.startswith('parando'):
-                    pass
-                elif not self.S['running']:
-                    self.msg = self.msg if self.msg.startswith('erro') else ''
+                if self.msg and time.time() > self.msg_until:
+                    self.msg = ''
             self.draw()
             self.scr.refresh()
             k = self.scr.getch()

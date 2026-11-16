@@ -94,6 +94,13 @@
   td.r{color:var(--reward)} td.p{color:var(--punish)}
   details{margin-top:4px} summary{cursor:pointer;color:var(--dim)}
   pre{margin-top:10px;max-height:240px;overflow:auto;color:var(--dim);font-size:12px;white-space:pre-wrap;word-break:break-word}
+  .rule{color:var(--dim);font-size:12px;margin-top:10px}
+  .help{margin-top:6px;color:var(--dim);font-size:12px}.help summary{cursor:pointer;letter-spacing:.14em;text-transform:uppercase;font-size:11px}
+  .help dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin-top:10px;max-width:92ch}.help dt{color:var(--reward)}.help dd{color:var(--ink)}
+  .gal{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}
+  .gal figure{border-top:1px solid var(--rule);padding-top:10px}.gal img{width:100%;display:block;background:#fff;border-radius:2px}
+  .gal figcaption{color:var(--dim);font-size:12px;margin-top:6px}
+  input:disabled,select:disabled{opacity:.45;cursor:not-allowed}
   footer{padding-top:18px;color:var(--dim);font-size:12px;border-top:1px solid var(--rule);max-width:80ch}
 
   @media (max-width:900px){
@@ -125,6 +132,19 @@
   </header>
   <div class="prog" id="prog" role="progressbar" aria-label="Progresso das épocas" aria-valuemin="0" aria-valuemax="100"><i></i></div>
   <div class="banner" id="banner" role="status"></div>
+  <p class="rule" id="rule" aria-live="polite"></p>
+  <details class="help"><summary>como funcionam as configurações</summary>
+    <dl>
+      <dt>Épocas</dt><dd>Quantas vezes a rede vê o conjunto de treino inteiro. Mais épocas = mais aprendizado e mais tempo. É um <b>limite</b>: o treino pode parar antes (veja “Para quando”).</dd>
+      <dt>Para quando</dt><dd>1) acabaram as épocas · 2) o mAP50 chegou ao alvo · 3) passaram 100 épocas seguidas sem melhorar (patience) · 4) você apertou Parar. Ao fim, esta tela diz qual foi o motivo.</dd>
+      <dt>Alvo mAP50</dt><dd>Nota de 0 a 1 de quão bem a rede acha os objetos. Chegou nela, o treino encerra. Se o modelo de partida (best.pt) já passa do alvo, o alvo é ignorado e o treino segue até acabarem as épocas.</dd>
+      <dt>Batch</dt><dd>Imagens processadas por vez. Maior = mais rápido, mas usa mais memória da GPU. 0 = máximo (ocupa 90% da VRAM).</dd>
+      <dt>RAM / VRAM</dt><dd>RAM: quanto de memória pode guardar as imagens em cache. VRAM: quanto da placa de vídeo o treino pode usar. 0 = sem limite.</dd>
+      <dt>Modelo</dt><dd>Ponto de partida. best.pt = continua do melhor treino já feito e tenta melhorar (com taxa de aprendizado baixa).</dd>
+      <dt>▲ / ▼</dt><dd>Recompensa: o mAP50 subiu em relação à época anterior. Punição: caiu. A rede corrige os pesos a partir do erro (loss) contra os rótulos: é aprendizado supervisionado.</dd>
+      <dt>Importante</dt><dd>Mudar a configuração não afeta um treino em andamento. Os campos ficam travados enquanto treina: pare e inicie de novo.</dd>
+    </dl>
+  </details>
 
   <div class="hero">
     <div>
@@ -162,6 +182,12 @@
       <div class="label"><span>diário de treino</span><span id="dev">—</span></div>
       <table><thead><tr><th>ép</th><th>mAP50</th><th>box</th><th>cls</th><th>Δw%</th><th>veredito</th></tr></thead><tbody id="rows"></tbody></table>
     </div>
+  </section>
+
+  <section id="imgsec" hidden>
+    <div class="label"><span>imagens e arquivos deste treino</span><span>atualizam durante o treino · clique para ampliar</span></div>
+    <p class="rule" id="runfiles"></p>
+    <div class="gal" id="gallery"></div>
   </section>
 
   <section>
@@ -219,7 +245,7 @@ function render(){
   renderModels();
   $('rep').hidden = !S.report_ready;
   const ev = S.events, eps = ev.filter(e=>e.type==='epoch'), start = ev.find(e=>e.type==='start'),
-        last = eps[eps.length-1], goal = ev.some(e=>e.type==='goal');
+        last = eps[eps.length-1], goal = ev.some(e=>e.type==='goal'), end = ev.find(e=>e.type==='end');
   const total = (last||start||{}).epochs, target = (start||{}).target ?? +$('target').value;
 
   // status
@@ -240,14 +266,24 @@ function render(){
 
   // banners
   if(S.exit_code>0 && !goal) banner('err', 'O treino falhou (código '+S.exit_code+'). Veja “saída do processo” abaixo. '+(S.log.slice(-2).join(' · ')));
+  else if(end) banner(end.reason==='goal' ? 'ok' : 'info', end.text);
   else if(goal) banner('ok', `Alvo atingido: mAP50 ${f3(last&&last.map50)} ≥ ${target}. Melhor modelo salvo em models/best.pt.`);
   else if(!S.running && !last && !S.dataset_ready) banner('info', 'Dataset COCO não encontrado: será baixado e balanceado antes do treino (pode levar um tempo).');
   else if(S.running && !last) banner('info', S.dataset_ready ? 'Preparando… carregando modelo e dataset.' : 'Baixando anotações e imagens do COCO. Acompanhe em “saída do processo”.');
   else if(!S.running) banner('', '');
 
+  // regra de parada (explica o que as épocas realmente fazem) + trava os campos durante o treino
+  const run = S.running && start, epN = run ? start.epochs : +$('epochs').value,
+        tgt = run ? start.target : +$('target').value, pat = (run && start.patience) || 100;
+  $('rule').textContent = `Para quando: acabarem ${epN} épocas · ou mAP50 ≥ ${(+tgt).toFixed(2)}` +
+    (run && start.goal_on === false ? ' (alvo ignorado: o modelo de partida já o supera)' : '') +
+    ` · ou ${pat} épocas seguidas sem melhorar · ou você parar.`;
+  document.querySelectorAll('#form input, #form select').forEach(el => { el.disabled = !!S.running; });
+  $('form').title = S.running ? 'Pare o treino para mudar a configuração' : '';
+
   // herói
-  const m = last ? last.map50 : 0, big = $('big');
-  big.classList.toggle('idle', !last); countTo(big, m);
+  const m = last ? last.map50 : ((start && start.baseline) || 0), big = $('big');
+  big.classList.toggle('idle', !last && !m); countTo(big, m);
   $('fill').style.width = (m*100)+'%';
   $('goal').style.left = (target*100)+'%'; $('goalLabel').textContent = 'ALVO '+(+target).toFixed(2);
 
@@ -263,7 +299,7 @@ function render(){
     $('vtext').textContent = v==='reward' ? 'Errou menos. Os pesos que ajudaram foram reforçados.' : 'Errou mais. O gradiente empurra os pesos para corrigir o erro.';
   }else{
     $('vword').textContent = '—'; $('vdelta').textContent = '';
-    $('vtext').textContent = last ? 'Sem variação de mAP50 nesta época.' : 'Inicie o treino para ver a rede ser recompensada quando acerta e punida quando erra.';
+    $('vtext').textContent = last ? 'Sem variação de mAP50 nesta época.' : m ? `Ponto de partida: mAP50 ${f3(m)}, melhorando o modelo já treinado.` : 'Inicie o treino para ver a rede ser recompensada quando acerta e punida quando erra.';
   }
 
   renderTiles(last || start);
@@ -274,6 +310,23 @@ function render(){
   $('dev').textContent = eps.length ? eps.length+' épocas' : '—';
   if(S.log.length) $('log').textContent = S.log.join('\n');
   drawChart(eps, target, total);
+  renderGallery();
+}
+
+function renderGallery(){
+  const imgs = S.images || [], g = $('gallery'), sig = imgs.map(i => i.name + i.v).join('|');
+  const files = S.files || [];
+  $('imgsec').hidden = !imgs.length && !files.length;
+  $('runfiles').textContent = files.length ? 'Arquivos do run (' + (S.run_dir || '') + '): ' +
+    files.map(f => `${f.name} · ${f.size > 1e6 ? (f.size / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(f.size / 1e3)) + ' KB'}`).join('  ·  ') : '';
+  if(!imgs.length || g.dataset.sig === sig) return;
+  g.dataset.sig = sig;
+  g.replaceChildren(...imgs.map(i => {
+    const f = document.createElement('figure'), a = document.createElement('a'), im = document.createElement('img'), c = document.createElement('figcaption');
+    a.href = im.src = `/img/${i.name}?v=${i.v}`; a.target = '_blank'; a.rel = 'noopener';
+    im.alt = i.caption; im.loading = 'lazy'; c.textContent = i.caption;
+    a.append(im); f.append(a, c); return f;
+  }));
 }
 
 function renderTiles(src){
@@ -364,6 +417,7 @@ async function poll(once){
   }
   if(!once) setTimeout(poll, S.running ? 1000 : 2500);
 }
+['target', 'epochs'].forEach(id => $(id).addEventListener('input', render));
 poll();
 </script>
 </body>

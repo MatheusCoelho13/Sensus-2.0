@@ -1,7 +1,11 @@
 # Sensus IA - treino. (Targets antigos removidos; histórico no git: git show HEAD:apps/ia-service/Makefile)
 PER_CLASS ?= 1000
 VAL_PER_CLASS ?= 200
-MODEL ?= models/yolov8n.pt
+# Se existir models/best.pt o treino continua dele (refinando); senão parte do yolov8n.
+MODEL ?= $(if $(wildcard models/best.pt),models/best.pt,models/yolov8n.pt)
+# Parada: o treino termina quando acabam EPOCHS, OU o mAP50 chega a TARGET, OU passam PATIENCE épocas sem melhorar.
+EPOCHS ?= 300
+PATIENCE ?= 100
 TARGET ?= 0.60
 # Recursos: 0 = usar o MÁXIMO; qualquer valor > 0 vira limite.
 # BATCH: imagens por passo (0 = ocupa 90% da VRAM) | RAM_GB: cache de imagens em RAM (0 = toda a RAM livre)
@@ -26,6 +30,7 @@ help:
 	@echo "  make coco        - dataset + train_coco"
 	@echo "  make publicar    - sobe models/best.pt + relatório pro GitHub (commit só desses arquivos). Ex: make treinar publicar"
 	@echo "  make relatorio   - relatório com matriz de confusão por classe (WEIGHTS=models/best.pt); também sai no fim do treino"
+	@echo "  parada: EPOCHS=300 PATIENCE=100 TARGET=0.60  (para quando acabam as épocas, ou mAP50 >= TARGET, ou PATIENCE épocas sem melhorar)"
 	@echo "  recursos (0 = máximo, padrão): BATCH= RAM_GB= VRAM_GB= WORKERS=   Ex: make treinar VRAM_GB=4 BATCH=8"
 
 tui:
@@ -41,10 +46,10 @@ dataset:
 treinar:
 	@[ -d datasets/coco_nav/images/train ] || $(MAKE) dataset
 	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 $(MEM) \
-		--cls-weight auto --max-epochs 300 --patience 100 --target-map $(TARGET)
+		--cls-weight auto --max-epochs $(EPOCHS) --patience $(PATIENCE) --target-map $(TARGET)
 
 train_coco:
-	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 $(MEM) --cls-weight auto --patience 15
+	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 $(MEM) --cls-weight auto --max-epochs $(EPOCHS) --patience 15
 
 coco: dataset train_coco
 
