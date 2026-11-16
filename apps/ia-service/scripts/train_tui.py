@@ -4,7 +4,7 @@
   make tui
 
 Mesmo motor do painel web (scripts/train_ui.py): sobe o train.py, lê runs/ui/events.jsonl.
-Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v VRAM · m modelo · l log · q sair (para o treino)
+Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v VRAM · m modelo · o relatório · l log · q sair (para o treino)
 """
 import curses
 import sys
@@ -24,9 +24,9 @@ GLYPH = {
 }
 EIGHTHS = ' ▁▂▃▄▅▆▇█'
 EPOCH_CHOICES = [50, 100, 300, 600]
-BATCH_CHOICES = [4, 8, 16, 32, 64]
-RAM_CHOICES = [0, 2, 4, 8, 16, 32]    # GB p/ cache de imagens; 0 = automático
-VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]  # GB de GPU; 0 = sem limite
+BATCH_CHOICES = [0, 4, 8, 16, 32, 64]   # 0 = máximo (ocupa a GPU)
+RAM_CHOICES = [0, 2, 4, 8, 16, 32]       # GB p/ cache de imagens; 0 = máximo (toda a RAM livre)
+VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]    # GB de GPU; 0 = máximo (a GPU inteira)
 
 INK, REWARD, PUNISH, DIM, L1, L2, L3 = range(1, 8)
 
@@ -79,8 +79,9 @@ class UI:
     def __init__(self, scr):
         self.scr, self.msg, self.show_log = scr, '', False
         self.target, self.epochs_i, self.model = 0.60, 2, ''
-        self.batch_i, self.ram_i, self.vram_i = 2, 0, 0
-        self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [],
+        self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
+        self.quitting = False
+        self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [], 'report_ready': False,
                                               'exit_code': None}, 0.0, {}
         curses.curs_set(0)
         curses.start_color()
@@ -181,7 +182,7 @@ class UI:
         try:
             if self.S['running']:
                 core.stop()
-                self.msg = 'parando treino…'
+                self.msg = 'parando: terminando a época e salvando best.pt/last.pt…'
             elif not self.model:
                 self.msg = 'erro: nenhum .pt em models/ — coloque um modelo lá'
             else:
@@ -194,7 +195,12 @@ class UI:
 
     def key(self, k):
         if k in (ord('q'), ord('Q')):
-            core.stop()
+            if self.S['running'] and not self.quitting:
+                core.stop()
+                self.quitting = True
+                self.msg = 'parando: terminando a época e salvando best.pt/last.pt… (q de novo força a saída)'
+                return True
+            core.kill()
             return False
         if k in (ord('s'), ord('S')):
             self.toggle()
@@ -214,6 +220,13 @@ class UI:
             self.ram_i = (self.ram_i + 1) % len(RAM_CHOICES)
         elif k in (ord('v'), ord('V')):
             self.vram_i = (self.vram_i + 1) % len(VRAM_CHOICES)
+        elif k in (ord('o'), ord('O')):
+            if core.REPORT.exists():
+                import webbrowser
+                if not webbrowser.open(core.REPORT.as_uri()):
+                    self.msg = f'erro: sem navegador; abra {core.REPORT}'
+            else:
+                self.msg = 'erro: ainda não há relatório (termine um treino ou rode make relatorio)'
         elif k in (ord('l'), ord('L')):
             self.show_log = not self.show_log
         return True
@@ -271,8 +284,9 @@ class UI:
         self.put(6, 41, f'▼ {np_}', PUNISH, True)
 
         ram, vram = RAM_CHOICES[self.ram_i], VRAM_CHOICES[self.vram_i]
-        cfg = (f'épocas {EPOCH_CHOICES[self.epochs_i]} · batch {BATCH_CHOICES[self.batch_i]} · '
-               f'RAM {f"{ram}GB" if ram else "auto"} · VRAM {f"{vram}GB" if vram else "livre"} · '
+        bs = BATCH_CHOICES[self.batch_i]
+        cfg = (f'épocas {EPOCH_CHOICES[self.epochs_i]} · batch {bs or "máx"} · '
+               f'RAM {f"{ram}GB" if ram else "máx"} · VRAM {f"{vram}GB" if vram else "máx"} · '
                f'modelo {(self.model.split("/")[-1][:-3] or "—") if self.model else "—"}')
         self.put(7, 2, cfg, DIM)
 
@@ -351,6 +365,8 @@ class UI:
             ban = 'Preparando… (pressione l para ver a saída do processo)'
         elif not S['running'] and not last and not S['dataset_ready']:
             ban = 'Dataset COCO não encontrado: será baixado e balanceado antes do treino.'
+        if S.get('report_ready') and not S['running'] and not ban:
+            ban = 'Relatório com matriz de confusão pronto: tecla o abre no navegador (runs/report/latest.html)'
         if self.msg:
             ban, bp = self.msg, PUNISH
         self.footer(ban, bp)
@@ -359,7 +375,7 @@ class UI:
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 1, ban[: w - 3], bp)
         info = (f's {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · b batch · r RAM · '
-                f'v VRAM · m modelo · l {"voltar" if self.show_log else "log"} · q sair')
+                f'v VRAM · m modelo · o relatório · l {"voltar" if self.show_log else "log"} · q sair')
         self.put(h - 1, 1, info, DIM)
 
     def log_view(self):
@@ -375,6 +391,8 @@ class UI:
             now = time.time()
             if now - self.last_poll > 1.0:
                 self.S, self.last_poll = core.state(), now
+                if self.quitting and not self.S['running']:
+                    return
                 if self.model not in self.S['models']:
                     self.model = self.S['models'][0] if self.S['models'] else ''
                 if self.S['running'] and self.msg.startswith('parando'):

@@ -24,6 +24,7 @@ RUN_DIR = ROOT / 'runs' / 'ui'
 EVENTS, LOG = RUN_DIR / 'events.jsonl', RUN_DIR / 'train.log'
 PAGE = ROOT / 'static' / 'treino.html'
 DATASET = ROOT / 'datasets' / 'coco_nav' / 'images' / 'train'
+REPORT = ROOT / 'runs' / 'report' / 'latest.html'
 
 lock = threading.Lock()
 proc: 'subprocess.Popen | None' = None
@@ -54,7 +55,7 @@ def validate(body: dict) -> dict:
     if not re.fullmatch(r'[\w ./-]+\.pt', model) or '..' in model or model.startswith('/'):
         raise ValueError('model deve ser um caminho relativo .pt (ex: models/yolov8n.pt)')
     return dict(target=num('target', float, 0.05, 0.99, 0.6), epochs=num('max_epochs', int, 1, 1000, 300),
-                imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 1, 128, 16), ram_gb=num('ram_gb', float, 0, 1024, 0),
+                imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 0, 128, 0), ram_gb=num('ram_gb', float, 0, 1024, 0),
                 vram_gb=num('vram_gb', float, 0, 256, 0), model=model)
 
 
@@ -71,7 +72,7 @@ def start(body: dict):
                  '--batch', str(a['batch']), '--cls-weight', 'auto', '--max-epochs', str(a['epochs']),
                  '--patience', '100', '--target-map', str(a['target']), '--events', str(EVENTS),
                  '--ram-gb', str(a['ram_gb']), '--vram-gb', str(a['vram_gb'])]
-        cmd = shlex.join(train)
+        cmd = 'exec ' + shlex.join(train)   # exec: o pid do subprocesso passa a ser o do python
         if not DATASET.exists():  # baixa/balanceia o COCO antes se ainda não existe
             cmd = shlex.join([py, 'scripts/build_coco_dataset.py']) + ' && ' + cmd
         last_cmd = cmd
@@ -80,10 +81,22 @@ def start(body: dict):
                                 start_new_session=True, env={**os.environ, 'PYTHONUNBUFFERED': '1'})
 
 
+STOP_GRACE = 180  # s p/ o treino salvar os pesos antes de ser morto à força
+
+
+def kill():
+    if running():
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
 def stop():
+    """SIGTERM: o train.py termina a época e salva best.pt/last.pt. Se não sair em STOP_GRACE s, SIGKILL."""
     with lock:
         if running():
             os.killpg(proc.pid, signal.SIGTERM)
+            t = threading.Timer(STOP_GRACE, kill)
+            t.daemon = True
+            t.start()
 
 
 def read_events() -> list:
@@ -111,7 +124,7 @@ def read_log(n: int = 60) -> list:
 
 def state() -> dict:
     return dict(running=running(), exit_code=None if proc is None or running() else proc.returncode,
-                dataset_ready=DATASET.exists(), models=list_models(), events=read_events(), log=read_log())
+                dataset_ready=DATASET.exists(), report_ready=REPORT.exists(), models=list_models(), events=read_events(), log=read_log())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -129,6 +142,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(state())
         if self.path in ('/', '/index.html'):
             data = PAGE.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+        if self.path == '/relatorio' and REPORT.exists():
+            data = REPORT.read_bytes()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(data)))

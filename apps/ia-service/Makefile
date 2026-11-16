@@ -3,14 +3,18 @@ PER_CLASS ?= 1000
 VAL_PER_CLASS ?= 200
 MODEL ?= models/yolov8n.pt
 TARGET ?= 0.60
-BATCH ?= 16
+# Recursos: 0 = usar o MÁXIMO; qualquer valor > 0 vira limite.
+# BATCH: imagens por passo (0 = ocupa 90% da VRAM) | RAM_GB: cache de imagens em RAM (0 = toda a RAM livre)
+# VRAM_GB: limite de GPU (0 = a GPU inteira)       | WORKERS: leitura de dados (0 = todos os núcleos da CPU)
+BATCH ?= 0
 RAM_GB ?= 0
 VRAM_GB ?= 0
-MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB)
+WORKERS ?= 0
+MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB) --workers $(WORKERS)
 PY = $(if $(wildcard .venv/bin/activate),. .venv/bin/activate && python3,python3)
 
 .DEFAULT_GOAL := help
-.PHONY: help tui painel dataset treinar train_coco coco
+.PHONY: help tui painel dataset treinar train_coco coco relatorio publicar
 
 help:
 	@echo "Sensus IA - comandos:"
@@ -20,7 +24,9 @@ help:
 	@echo "  make treinar     - treina até TARGET de mAP50 (padrão 0.60); baixa o dataset se faltar"
 	@echo "  make train_coco  - treino rápido (patience 15) com o dataset já pronto"
 	@echo "  make coco        - dataset + train_coco"
-	@echo "  memória: BATCH=16 RAM_GB=8 VRAM_GB=4  (0 = automático/sem limite). Ex: make treinar VRAM_GB=4 BATCH=8"
+	@echo "  make publicar    - sobe models/best.pt + relatório pro GitHub (commit só desses arquivos). Ex: make treinar publicar"
+	@echo "  make relatorio   - relatório com matriz de confusão por classe (WEIGHTS=models/best.pt); também sai no fim do treino"
+	@echo "  recursos (0 = máximo, padrão): BATCH= RAM_GB= VRAM_GB= WORKERS=   Ex: make treinar VRAM_GB=4 BATCH=8"
 
 tui:
 	$(PY) scripts/train_tui.py
@@ -41,3 +47,10 @@ train_coco:
 	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 $(MEM) --cls-weight auto --patience 15
 
 coco: dataset train_coco
+
+WEIGHTS ?= models/best.pt
+relatorio:
+	$(PY) scripts/report.py --weights $(WEIGHTS) --data config/data.yaml --imgsz 640
+
+publicar:
+	$(PY) scripts/publish.py

@@ -42,3 +42,35 @@ def test_auto_limit_uses_free_ram():
     assert train.pick_cache('ram', 0, y, 640) is False
     train.available_ram_gb = lambda: 100
     assert train.pick_cache('ram', 0, y, 640) == 'ram'
+
+
+def _fake_gpu(total_gb=4.0, available=True):
+    cuda = types.SimpleNamespace(
+        is_available=lambda: available,
+        get_device_properties=lambda i: types.SimpleNamespace(total_memory=total_gb * 1e9))
+    sys.modules['torch'].cuda = cuda
+
+
+def test_batch_zero_means_max_gpu():
+    _fake_gpu(4.0)
+    assert train.resolve_batch(16, '0') == (16, 16)              # fixo continua fixo
+    assert train.resolve_batch(0, '0') == (0.9, 16)              # máximo: 90% da GPU inteira
+    assert train.resolve_batch(0, '0', vram_gb=2) == (0.45, 16)  # máximo dentro do limite de VRAM
+    assert train.resolve_batch(0, '0', vram_gb=99) == (0.9, 16)  # limite maior que a GPU = GPU inteira
+    assert train.resolve_batch(0, 'cpu') == (16, 16)
+    _fake_gpu(available=False)
+    assert train.resolve_batch(0, '0') == (16, 16)               # sem CUDA
+
+
+def test_workers_zero_means_all_cores():
+    import os
+    assert train.resolve_workers(0) == (os.cpu_count() or 8)
+    assert train.resolve_workers(3) == 3
+
+
+def test_ram_zero_means_all_free_ram():
+    y = make_dataset()
+    train.available_ram_gb = lambda: 0.2       # 0 = toda a RAM livre (0.2GB) >= ~0.11GB estimados
+    assert train.pick_cache('ram', 0, y, 640) == 'ram'
+    train.available_ram_gb = lambda: 0.05
+    assert train.pick_cache('ram', 0, y, 640) is False

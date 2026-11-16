@@ -16,6 +16,7 @@ chunks que reiniciavam o agendamento de LR a cada N épocas.
 import argparse
 import json
 import shutil
+import signal
 import time
 from pathlib import Path
 
@@ -24,6 +25,15 @@ import yaml
 from ultralytics import YOLO
 
 DEFAULT_RUN_NAME = 'train_iter'
+STOP = {'asked': False}
+
+
+def _ask_stop(signum, frame):
+    """q / Ctrl+C: termina a época atual e salva best.pt/last.pt (2ª vez = aborta na hora)."""
+    if STOP['asked']:
+        raise KeyboardInterrupt
+    STOP['asked'] = True
+    print('🛑 parada pedida: terminando a época e salvando best.pt/last.pt… (de novo = abortar)')
 
 
 def parse_args():
@@ -35,7 +45,7 @@ def parse_args():
     p.add_argument('--data', default='config/data.yaml')
     p.add_argument('--model', default=None, help='peso .pt inicial (ex: models/meu.pt). Sem ele: continua do models/best.pt ou usa yolov8s.pt')
     p.add_argument('--imgsz', type=int, default=768)
-    p.add_argument('--batch', type=int, default=16)
+    p.add_argument('--batch', type=int, default=0, help='imagens por passo (0 = máximo: ocupa 90%% da VRAM; em CPU usa 16)')
     p.add_argument('--device', default='auto')
     p.add_argument('--require-cuda', action='store_true')
     p.add_argument('--cls-weight', default='', help="'auto' ou lista 'w0,w1,...' (peso de erro por classe)")
@@ -43,9 +53,9 @@ def parse_args():
     p.add_argument('--freeze', type=int, default=0, help='congela N primeiras camadas (use 10 com dataset pequeno)')
     p.add_argument('--lr0', type=float, default=None, help='learning rate inicial (default: automático)')
     p.add_argument('--cache', default='ram', choices=['ram', 'disk', 'false'], help='cache das imagens (ram = mais rápido)')
-    p.add_argument('--workers', type=int, default=8, help='processos de data loading')
-    p.add_argument('--ram-gb', type=float, default=0, help='limite de RAM p/ o cache de imagens em GB (0 = automático: 60%% da RAM livre)')
-    p.add_argument('--vram-gb', type=float, default=0, help='limite de VRAM do processo em GB (0 = sem limite); estoura OOM em vez de travar a máquina')
+    p.add_argument('--workers', type=int, default=0, help='processos de data loading (0 = máximo: todos os núcleos da CPU)')
+    p.add_argument('--ram-gb', type=float, default=0, help='limite de RAM p/ o cache de imagens em GB (0 = máximo: toda a RAM livre)')
+    p.add_argument('--vram-gb', type=float, default=0, help='limite de VRAM do processo em GB (0 = máximo: a GPU inteira); passou do limite dá OOM em vez de travar a máquina')
     p.add_argument('--fast-validate', action='store_true', help='validação final em resolução/batch menores')
     p.add_argument('--skip-validate', action='store_true', help='pula validação final de models/best.pt')
     p.add_argument('--run-name', default=DEFAULT_RUN_NAME)
@@ -85,10 +95,10 @@ def estimate_cache_gb(data_yaml: str, imgsz: int) -> float:
 
 
 def pick_cache(cache: str, ram_gb: float, data_yaml: str, imgsz: int) -> str:
-    """cache=ram só se couber no limite (--ram-gb, ou 60% da RAM livre); senão desliga em vez de estourar a RAM."""
+    """cache=ram só se couber no limite (--ram-gb; 0 = toda a RAM livre); senão desliga em vez de estourar a RAM."""
     if cache != 'ram':
         return False if cache == 'false' else cache
-    limit = ram_gb or (0.6 * (available_ram_gb() or 0)) or None
+    limit = ram_gb or available_ram_gb() or None
     if limit is None:
         return cache
     est = estimate_cache_gb(data_yaml, imgsz)
@@ -99,10 +109,37 @@ def pick_cache(cache: str, ram_gb: float, data_yaml: str, imgsz: int) -> str:
     return False
 
 
+def cuda_index(device) -> int:
+    last = str(device).split(':')[-1]
+    return int(last) if last.isdigit() else 0
+
+
+def has_gpu(device) -> bool:
+    return str(device) != 'cpu' and torch.cuda.is_available()
+
+
+def resolve_batch(batch: int, device, vram_gb: float = 0):
+    """(batch de treino, batch de validação). batch>0 é fixo. 0 = máximo: o Ultralytics aceita fração 0-1
+    e dimensiona o batch p/ ocupar essa parte da VRAM (90%% da GPU, ou do limite --vram-gb). Em CPU: 16."""
+    if batch > 0:
+        return batch, batch
+    if not has_gpu(device):
+        return 16, 16
+    total = torch.cuda.get_device_properties(cuda_index(device)).total_memory / 1e9
+    frac = 0.9 * (min(1.0, vram_gb / total) if vram_gb else 1.0)
+    print(f'🚀 batch máximo: ocupar {frac:.0%} dos {total:.1f}GB da GPU')
+    return round(frac, 2), 16
+
+
+def resolve_workers(workers: int) -> int:
+    import os
+    return workers or os.cpu_count() or 8
+
+
 def apply_vram_limit(device: str, gb: float):
-    if not gb or not torch.cuda.is_available() or str(device) == 'cpu':
+    if not gb or not has_gpu(device):
         return
-    idx = int(str(device).split(':')[-1]) if str(device).split(':')[-1].isdigit() else 0
+    idx = cuda_index(device)
     total = torch.cuda.get_device_properties(idx).total_memory / 1e9
     frac = min(1.0, gb / total)
     torch.cuda.set_per_process_memory_fraction(frac, idx)
@@ -133,10 +170,13 @@ def class_weights_from_data(data_yaml: str):
     return [total / (nc * c) if c else 1.0 for c in counts]
 
 
+def val_metrics(weight: Path, data: str, imgsz: int, batch: int, device: str, fast: bool):
+    return YOLO(str(weight)).val(data=data, imgsz=imgsz // 2 if fast else imgsz,
+                                 batch=max(1, batch // 2) if fast else batch, device=device)
+
+
 def validate(weight: Path, data: str, imgsz: int, batch: int, device: str, fast: bool) -> float:
-    m = YOLO(str(weight)).val(data=data, imgsz=imgsz // 2 if fast else imgsz,
-                              batch=max(1, batch // 2) if fast else batch, device=device)
-    return float(m.box.map50)
+    return float(val_metrics(weight, data, imgsz, batch, device, fast).box.map50)
 
 
 def emit(path: str, **ev):
@@ -213,7 +253,13 @@ def make_callbacks(target_map: float, cls_weights, events: str = ''):
         state.update(loss=losses, delta=delta, delta_pct=100 * delta / norm)
         print(f'🧠 época {trainer.epoch + 1}: loss[{loss}] | Δpesos={delta:.4f} ({100 * delta / norm:.2f}% da norma)')
 
+    def on_train_batch_end(trainer):
+        if STOP['asked']:
+            trainer.stop = True
+
     def on_fit_epoch_end(trainer):
+        if STOP['asked']:
+            trainer.stop = True
         map50 = trainer.metrics.get('metrics/mAP50(B)', 0.0)
         # "recompensa/punição" = o erro (loss) guiando o ajuste dos pesos; aprendizado supervisionado,
         # não RL. Aqui só mostramos se a época foi pra frente (acertou mais) ou pra trás (errou mais).
@@ -236,16 +282,19 @@ def make_callbacks(target_map: float, cls_weights, events: str = ''):
             emit(events, type='goal', map50=map50)
             trainer.stop = True
 
-    return {'on_train_start': safe(on_train_start), 'on_train_epoch_end': safe(on_train_epoch_end),
+    return {'on_train_batch_end': safe(on_train_batch_end), 'on_train_start': safe(on_train_start), 'on_train_epoch_end': safe(on_train_epoch_end),
             'on_fit_epoch_end': safe(on_fit_epoch_end)}
 
 
 def main():
     args = parse_args()
     root = Path(__file__).parent.parent
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _ask_stop)
     device = select_device(args.device, args.require_cuda)
     print(f'Usando device: {device}')
     apply_vram_limit(device, args.vram_gb)
+    train_batch, val_batch = resolve_batch(args.batch, device, args.vram_gb)
 
     cls_weights = None
     if args.cls_weight:
@@ -263,27 +312,40 @@ def main():
     best_pt = root / 'models' / 'best.pt'
     baseline = -1.0
     if best_pt.exists() and not args.skip_validate:
-        baseline = validate(best_pt, args.data, args.imgsz, args.batch, device, args.fast_validate)
+        baseline = validate(best_pt, args.data, args.imgsz, val_batch, device, args.fast_validate)
         print(f'📌 baseline mAP50 = {baseline:.3f}')
 
-    kwargs = dict(data=args.data, epochs=args.max_epochs, imgsz=args.imgsz, batch=args.batch,
+    kwargs = dict(data=args.data, epochs=args.max_epochs, imgsz=args.imgsz, batch=train_batch,
                   device=device, name=args.run_name, exist_ok=True, patience=args.patience,
                   cos_lr=True, freeze=args.freeze or None, close_mosaic=10,
-                  cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=args.workers)
+                  cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=resolve_workers(args.workers))
     if args.lr0:
         kwargs['lr0'] = args.lr0
     model.train(**kwargs)
+    if STOP['asked']:  # parado pelo usuário: pesos já salvos pelo Ultralytics; pula validação/relatório (demoram)
+        wdir = Path(model.trainer.save_dir) / 'weights'
+        print(f'🛑 treino parado. Pesos salvos em {wdir} (best.pt e last.pt)')
+        emit(args.events, type='stopped', path=str(wdir))
+        return
 
     run_best = Path(model.trainer.best)
     if not run_best.exists():
         print('⚠️ best.pt do run não encontrado — veja runs/detect')
         return
-    new = validate(run_best, args.data, args.imgsz, args.batch, device, args.fast_validate)
+    mm = val_metrics(run_best, args.data, args.imgsz, val_batch, device, args.fast_validate)
+    new = float(mm.box.map50)
     print(f'📈 mAP50 do run = {new:.3f} (baseline {baseline:.3f})')
     if new > baseline:
         best_pt.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(run_best, best_pt)
         print(f'📦 models/best.pt atualizado (mAP50={new:.3f})')
+    try:  # relatório com matriz de confusão (geral e por classe); nunca derruba o fim do treino
+        from report import write_report
+        rep = write_report(run_best, args.data, root / 'runs' / 'report', args.imgsz, val_batch, device, map_metrics=mm)
+        print(f'📄 Relatório com matriz de confusão: {rep}')
+        emit(args.events, type='report', path=str(rep))
+    except Exception as e:  # noqa: BLE001
+        print(f'⚠️ não foi possível gerar o relatório ({type(e).__name__}: {e}) — rode: make relatorio')
 
 
 if __name__ == '__main__':
