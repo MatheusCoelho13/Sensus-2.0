@@ -30,6 +30,12 @@ proc: 'subprocess.Popen | None' = None
 last_cmd = ''
 
 
+def list_models() -> list:
+    """Todo .pt dentro de models/ (best.pt primeiro). Atualiza a cada poll: basta soltar o arquivo lá."""
+    found = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / 'models').glob('*.pt'))
+    return sorted(found, key=lambda m: (not m.endswith('/best.pt'), m))
+
+
 def running() -> bool:
     return proc is not None and proc.poll() is None
 
@@ -45,10 +51,11 @@ def validate(body: dict) -> dict:
             raise ValueError(f'{key} deve estar entre {lo} e {hi}')
         return v
     model = str(body.get('model', 'models/yolov8n.pt'))
-    if not re.fullmatch(r'[\w./-]+\.pt', model) or '..' in model or model.startswith('/'):
+    if not re.fullmatch(r'[\w ./-]+\.pt', model) or '..' in model or model.startswith('/'):
         raise ValueError('model deve ser um caminho relativo .pt (ex: models/yolov8n.pt)')
     return dict(target=num('target', float, 0.05, 0.99, 0.6), epochs=num('max_epochs', int, 1, 1000, 300),
-                imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 1, 128, 16), model=model)
+                imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 1, 128, 16), ram_gb=num('ram_gb', float, 0, 1024, 0),
+                vram_gb=num('vram_gb', float, 0, 256, 0), model=model)
 
 
 def start(body: dict):
@@ -62,7 +69,8 @@ def start(body: dict):
         py = sys.executable
         train = [py, 'scripts/train.py', '--data', 'config/data.yaml', '--model', a['model'], '--imgsz', str(a['imgsz']),
                  '--batch', str(a['batch']), '--cls-weight', 'auto', '--max-epochs', str(a['epochs']),
-                 '--patience', '100', '--target-map', str(a['target']), '--events', str(EVENTS)]
+                 '--patience', '100', '--target-map', str(a['target']), '--events', str(EVENTS),
+                 '--ram-gb', str(a['ram_gb']), '--vram-gb', str(a['vram_gb'])]
         cmd = shlex.join(train)
         if not DATASET.exists():  # baixa/balanceia o COCO antes se ainda não existe
             cmd = shlex.join([py, 'scripts/build_coco_dataset.py']) + ' && ' + cmd
@@ -103,7 +111,7 @@ def read_log(n: int = 60) -> list:
 
 def state() -> dict:
     return dict(running=running(), exit_code=None if proc is None or running() else proc.returncode,
-                dataset_ready=DATASET.exists(), events=read_events(), log=read_log())
+                dataset_ready=DATASET.exists(), models=list_models(), events=read_events(), log=read_log())
 
 
 class Handler(BaseHTTPRequestHandler):

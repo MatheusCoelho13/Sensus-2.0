@@ -3,6 +3,10 @@ PER_CLASS ?= 1000
 VAL_PER_CLASS ?= 200
 MODEL ?= models/yolov8n.pt
 TARGET ?= 0.60
+BATCH ?= 16
+RAM_GB ?= 0
+VRAM_GB ?= 0
+MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB)
 PY = $(if $(wildcard .venv/bin/activate),. .venv/bin/activate && python3,python3)
 
 .DEFAULT_GOAL := help
@@ -16,6 +20,7 @@ help:
 	@echo "  make treinar     - treina até TARGET de mAP50 (padrão 0.60); baixa o dataset se faltar"
 	@echo "  make train_coco  - treino rápido (patience 15) com o dataset já pronto"
 	@echo "  make coco        - dataset + train_coco"
+	@echo "  memória: BATCH=16 RAM_GB=8 VRAM_GB=4  (0 = automático/sem limite). Ex: make treinar VRAM_GB=4 BATCH=8"
 
 tui:
 	$(PY) scripts/train_tui.py
@@ -29,10 +34,10 @@ dataset:
 
 treinar:
 	@[ -d datasets/coco_nav/images/train ] || $(MAKE) dataset
-	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 --batch 16 \
+	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 $(MEM) \
 		--cls-weight auto --max-epochs 300 --patience 100 --target-map $(TARGET)
 
 train_coco:
-	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 --batch 16 --cls-weight auto --patience 15
+	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz 640 $(MEM) --cls-weight auto --patience 15
 
 coco: dataset train_coco

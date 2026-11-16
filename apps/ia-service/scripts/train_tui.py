@@ -4,7 +4,7 @@
   make tui
 
 Mesmo motor do painel web (scripts/train_ui.py): sobe o train.py, lê runs/ui/events.jsonl.
-Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · m modelo · l log · q sair (para o treino)
+Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v VRAM · m modelo · l log · q sair (para o treino)
 """
 import curses
 import sys
@@ -24,7 +24,9 @@ GLYPH = {
 }
 EIGHTHS = ' ▁▂▃▄▅▆▇█'
 EPOCH_CHOICES = [50, 100, 300, 600]
-MODELS = ['models/yolov8n.pt', 'models/yolov8s.pt']
+BATCH_CHOICES = [4, 8, 16, 32, 64]
+RAM_CHOICES = [0, 2, 4, 8, 16, 32]    # GB p/ cache de imagens; 0 = automático
+VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]  # GB de GPU; 0 = sem limite
 
 INK, REWARD, PUNISH, DIM, L1, L2, L3 = range(1, 8)
 
@@ -33,6 +35,22 @@ def rgb_to_xterm(r, g, b):
     if max(r, g, b) - min(r, g, b) < 12:  # cinza -> rampa 232-255
         return 232 + min(23, int(r / 256 * 24))
     return 16 + 36 * round(r / 255 * 5) + 6 * round(g / 255 * 5) + round(b / 255 * 5)
+
+
+def upscale(t, k, n):
+    """k×k RGB -> n×n RGB por interpolação bilinear: neurônio liso em vez de pixels enormes."""
+    out = []
+    for y in range(n):
+        sy = min(max((y + .5) * k / n - .5, 0), k - 1)
+        y0 = int(sy); y1 = min(y0 + 1, k - 1); fy = sy - y0
+        row = []
+        for x in range(n):
+            sx = min(max((x + .5) * k / n - .5, 0), k - 1)
+            x0 = int(sx); x1 = min(x0 + 1, k - 1); fx = sx - x0
+            row.append(tuple(round((t[y0][x0][c] * (1 - fx) + t[y0][x1][c] * fx) * (1 - fy)
+                                   + (t[y1][x0][c] * (1 - fx) + t[y1][x1][c] * fx) * fy) for c in range(3)))
+        out.append(row)
+    return out
 
 
 def digits_rows(value: float) -> list:
@@ -60,8 +78,9 @@ def spark(values: list, width: int) -> str:
 class UI:
     def __init__(self, scr):
         self.scr, self.msg, self.show_log = scr, '', False
-        self.target, self.epochs_i, self.model_i = 0.60, 2, 0
-        self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True,
+        self.target, self.epochs_i, self.model = 0.60, 2, ''
+        self.batch_i, self.ram_i, self.vram_i = 2, 0, 0
+        self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [],
                                               'exit_code': None}, 0.0, {}
         curses.curs_set(0)
         curses.start_color()
@@ -93,6 +112,64 @@ class UI:
             self.next_pair += 1
         return self.pairs[idx]
 
+    def half(self, top, bot):
+        """(char, pair) p/ um par de pixels (cima, baixo); None = fora do orbe (fundo do terminal)."""
+        if top is None and bot is None:
+            return None
+        if top is None:
+            return '▄', self.fgbg_pair(bot, None)
+        return '▀', self.fgbg_pair(top, bot)
+
+    def fgbg_pair(self, fg, bg):
+        key = (rgb_to_xterm(*fg), rgb_to_xterm(*bg) if bg else -1)
+        if key not in self.pairs:
+            if self.next_pair >= curses.COLOR_PAIRS:
+                return INK
+            curses.init_pair(self.next_pair, key[0], key[1])
+            self.pairs[key] = self.next_pair
+            self.next_pair += 1
+        return self.pairs[key]
+
+    def draw_neurons(self, f, y, h, w):
+        """Cada neurônio = filtro 3×3 suavizado, desenhado com meio-bloco (▀: cor de cima + cor de baixo).
+        Abaixo de cada um, uma barrinha mostra o quanto ele mudou nesta época."""
+        k, tiles, delta = f['k'], f['tiles'], f.get('delta')
+        n, avail = len(tiles), h - 3 - y
+        rich = self.c256 and curses.COLOR_PAIRS >= 4096
+        size = 8
+        if rich:
+            for cand in (8, 6, 4):
+                per = max(1, (min(w, 72) - 2) // (cand + 1))
+                size = cand
+                if -(-n // per) * (cand // 2 + 1) <= avail:
+                    break
+        tw = size if rich else k * 2          # largura do neurônio em colunas
+        th = size // 2 if rich else k         # altura em linhas
+        per = max(1, (min(w, 72) - 2) // (tw + 1))
+        dmax = max(delta or [0]) or 1e-12
+        for i, t in enumerate(tiles):
+            ty, tx = y + (i // per) * (th + 1), 2 + (i % per) * (tw + 1)
+            if ty + th + 1 > h - 2:
+                break
+            if rich:
+                px, c = upscale(t, k, size), (size - 1) / 2
+                ins = lambda x, yy: (x - c) ** 2 + (yy - c) ** 2 <= (size / 2) ** 2   # recorta os cantos: vira orbe
+                for r in range(th):
+                    for x in range(tw):
+                        cell = self.half(px[2 * r][x] if ins(x, 2 * r) else None, px[2 * r + 1][x] if ins(x, 2 * r + 1) else None)
+                        if cell:
+                            self.put(ty + r, tx + x, *cell)
+            else:
+                for yy in range(k):
+                    for xx in range(k):
+                        if self.c256:
+                            self.put(ty + yy, tx + xx * 2, '  ', self.bg_pair(t[yy][xx]))
+                        else:
+                            self.put(ty + yy, tx + xx * 2, '░░▒▒▓▓██'[int(sum(t[yy][xx]) / 765 * 7)] * 2, DIM)
+            if delta:
+                self.put(ty + th, tx, '▁' * tw, DIM)
+                self.put(ty + th, tx, '▁' * max(1, round(tw * delta[i] / dmax)), REWARD)
+
     def rule(self, y, label=''):
         h, w = self.scr.getmaxyx()
         self.put(y, 0, '─' * (w - 1), DIM)
@@ -105,8 +182,12 @@ class UI:
             if self.S['running']:
                 core.stop()
                 self.msg = 'parando treino…'
+            elif not self.model:
+                self.msg = 'erro: nenhum .pt em models/ — coloque um modelo lá'
             else:
-                core.start({'target': self.target, 'max_epochs': EPOCH_CHOICES[self.epochs_i], 'model': MODELS[self.model_i]})
+                core.start({'target': self.target, 'max_epochs': EPOCH_CHOICES[self.epochs_i], 'model': self.model,
+                            'batch': BATCH_CHOICES[self.batch_i], 'ram_gb': RAM_CHOICES[self.ram_i],
+                            'vram_gb': VRAM_CHOICES[self.vram_i]})
                 self.msg = ''
         except ValueError as e:
             self.msg = f'erro: {e}'
@@ -124,7 +205,15 @@ class UI:
         elif k in (ord('e'), ord('E')):
             self.epochs_i = (self.epochs_i + 1) % len(EPOCH_CHOICES)
         elif k in (ord('m'), ord('M')):
-            self.model_i = (self.model_i + 1) % len(MODELS)
+            ms = self.S['models']
+            if ms:
+                self.model = ms[(ms.index(self.model) + 1) % len(ms)] if self.model in ms else ms[0]
+        elif k in (ord('b'), ord('B')):
+            self.batch_i = (self.batch_i + 1) % len(BATCH_CHOICES)
+        elif k in (ord('r'), ord('R')):
+            self.ram_i = (self.ram_i + 1) % len(RAM_CHOICES)
+        elif k in (ord('v'), ord('V')):
+            self.vram_i = (self.vram_i + 1) % len(VRAM_CHOICES)
         elif k in (ord('l'), ord('L')):
             self.show_log = not self.show_log
         return True
@@ -133,6 +222,7 @@ class UI:
     def draw(self):
         scr, S = self.scr, self.S
         scr.erase()
+        self.pairs, self.next_pair = {}, 8   # pares de cor são recriados a cada quadro (sem vazar)
         h, w = scr.getmaxyx()
         if h < 24 or w < 80:
             self.put(0, 0, f'Terminal pequeno ({w}x{h}). Precisa de pelo menos 80x24.', PUNISH)
@@ -179,6 +269,12 @@ class UI:
         nr, np_ = sum(e.get('verdict') == 'reward' for e in eps), sum(e.get('verdict') == 'punish' for e in eps)
         self.put(6, 33, f'▲ {nr}', REWARD, True)
         self.put(6, 41, f'▼ {np_}', PUNISH, True)
+
+        ram, vram = RAM_CHOICES[self.ram_i], VRAM_CHOICES[self.vram_i]
+        cfg = (f'épocas {EPOCH_CHOICES[self.epochs_i]} · batch {BATCH_CHOICES[self.batch_i]} · '
+               f'RAM {f"{ram}GB" if ram else "auto"} · VRAM {f"{vram}GB" if vram else "livre"} · '
+               f'modelo {(self.model.split("/")[-1][:-3] or "—") if self.model else "—"}')
+        self.put(7, 2, cfg, DIM)
 
         # régua até o alvo
         bw = min(w - 6, 70)
@@ -227,23 +323,11 @@ class UI:
 
         # neurônios + diário
         if y < h - 7:
-            self.rule(y, 'neurônios · camada 1')
+            self.rule(y, 'neurônios · camada 1 · barra = quanto mudou')
             y += 1
             f = (last or start or {}).get('filters')
             if f:
-                k, tiles = f['k'], f['tiles']
-                per_row = max(1, (min(w, 70) - 2) // (k * 2 + 1))
-                for i, t in enumerate(tiles):
-                    ty, tx = y + (i // per_row) * (k + 1), 2 + (i % per_row) * (k * 2 + 1)
-                    if ty + k > h - 3:
-                        break
-                    for yy in range(k):
-                        for xx in range(k):
-                            if self.c256:
-                                self.put(ty + yy, tx + xx * 2, '  ', self.bg_pair(t[yy][xx]))
-                            else:
-                                lum = sum(t[yy][xx]) / 765
-                                self.put(ty + yy, tx + xx * 2, '░░▒▒▓▓██'[int(lum * 7)] * 2, DIM)
+                self.draw_neurons(f, y, h, w)
             else:
                 self.put(y, 2, '(sem dados dos filtros)', DIM)
             if w >= 100 and eps:  # diário à direita
@@ -274,8 +358,8 @@ class UI:
     def footer(self, ban='', bp=DIM):
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 1, ban[: w - 3], bp)
-        info = f's {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas {EPOCH_CHOICES[self.epochs_i]}' \
-               f' · m {MODELS[self.model_i].split("/")[-1][:-3]} · l {"voltar" if self.show_log else "log"} · q sair (para o treino)'
+        info = (f's {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · b batch · r RAM · '
+                f'v VRAM · m modelo · l {"voltar" if self.show_log else "log"} · q sair')
         self.put(h - 1, 1, info, DIM)
 
     def log_view(self):
@@ -291,6 +375,8 @@ class UI:
             now = time.time()
             if now - self.last_poll > 1.0:
                 self.S, self.last_poll = core.state(), now
+                if self.model not in self.S['models']:
+                    self.model = self.S['models'][0] if self.S['models'] else ''
                 if self.S['running'] and self.msg.startswith('parando'):
                     pass
                 elif not self.S['running']:

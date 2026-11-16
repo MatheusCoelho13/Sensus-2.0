@@ -33,7 +33,7 @@ def parse_args():
     p.add_argument('--target-map', type=float, default=0.60, help='para o treino ao atingir este mAP50')
     p.add_argument('--export-threshold', type=float, default=0.50)
     p.add_argument('--data', default='config/data.yaml')
-    p.add_argument('--model', default='yolov8s.pt')
+    p.add_argument('--model', default=None, help='peso .pt inicial (ex: models/meu.pt). Sem ele: continua do models/best.pt ou usa yolov8s.pt')
     p.add_argument('--imgsz', type=int, default=768)
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--device', default='auto')
@@ -44,6 +44,8 @@ def parse_args():
     p.add_argument('--lr0', type=float, default=None, help='learning rate inicial (default: automático)')
     p.add_argument('--cache', default='ram', choices=['ram', 'disk', 'false'], help='cache das imagens (ram = mais rápido)')
     p.add_argument('--workers', type=int, default=8, help='processos de data loading')
+    p.add_argument('--ram-gb', type=float, default=0, help='limite de RAM p/ o cache de imagens em GB (0 = automático: 60%% da RAM livre)')
+    p.add_argument('--vram-gb', type=float, default=0, help='limite de VRAM do processo em GB (0 = sem limite); estoura OOM em vez de travar a máquina')
     p.add_argument('--fast-validate', action='store_true', help='validação final em resolução/batch menores')
     p.add_argument('--skip-validate', action='store_true', help='pula validação final de models/best.pt')
     p.add_argument('--run-name', default=DEFAULT_RUN_NAME)
@@ -58,6 +60,53 @@ def select_device(arg_device: str, require_cuda: bool = False) -> str:
     if require_cuda and not cuda:
         raise RuntimeError('CUDA requerida, mas não disponível')
     return '0' if cuda else 'cpu'
+
+
+def available_ram_gb():
+    """RAM livre (GB) via /proc/meminfo; None fora do Linux."""
+    try:
+        for ln in Path('/proc/meminfo').read_text().splitlines():
+            if ln.startswith('MemAvailable:'):
+                return int(ln.split()[1]) / 1e6
+    except OSError:
+        pass
+    return None
+
+
+def estimate_cache_gb(data_yaml: str, imgsz: int) -> float:
+    """Imagens decodificadas (maior lado = imgsz, ~4:3, 3 canais) de train+val."""
+    d = yaml.safe_load(Path(data_yaml).read_text())
+    base, n = Path(d.get('path', '.')), 0
+    for split in ('train', 'val'):
+        rel = d.get(split)
+        if rel and (base / rel).is_dir():
+            n += sum(1 for f in (base / rel).rglob('*') if f.suffix.lower() in {'.jpg', '.jpeg', '.png'})
+    return n * imgsz * imgsz * 0.75 * 3 / 1e9
+
+
+def pick_cache(cache: str, ram_gb: float, data_yaml: str, imgsz: int) -> str:
+    """cache=ram só se couber no limite (--ram-gb, ou 60% da RAM livre); senão desliga em vez de estourar a RAM."""
+    if cache != 'ram':
+        return False if cache == 'false' else cache
+    limit = ram_gb or (0.6 * (available_ram_gb() or 0)) or None
+    if limit is None:
+        return cache
+    est = estimate_cache_gb(data_yaml, imgsz)
+    if est <= limit:
+        print(f'🧠 cache em RAM: ~{est:.1f}GB de {limit:.1f}GB permitidos')
+        return 'ram'
+    print(f'⚠️ cache em RAM (~{est:.1f}GB) passa do limite de {limit:.1f}GB: cache desligado (aumente --ram-gb ou use --cache disk)')
+    return False
+
+
+def apply_vram_limit(device: str, gb: float):
+    if not gb or not torch.cuda.is_available() or str(device) == 'cpu':
+        return
+    idx = int(str(device).split(':')[-1]) if str(device).split(':')[-1].isdigit() else 0
+    total = torch.cuda.get_device_properties(idx).total_memory / 1e9
+    frac = min(1.0, gb / total)
+    torch.cuda.set_per_process_memory_fraction(frac, idx)
+    print(f'🔒 VRAM limitada a {gb:.1f}GB ({frac:.0%} de {total:.1f}GB)')
 
 
 def find_start_weight(project_root: Path, default: str) -> str:
@@ -96,16 +145,42 @@ def emit(path: str, **ev):
             f.write(json.dumps({**ev, 't': time.time()}) + '\n')
 
 
-def first_layer_filters(trainer):
-    """Pesos da 1ª camada conv como tiles RGB 0-255 (o painel desenha os "neurônios" mudando)."""
+def first_layer_filters(trainer, prev=None):
+    """(payload, pesos_brutos). Neurônios da 1ª camada conv: tiles RGB 0-255 normalizados POR filtro
+    (mostra o padrão de cada um) + delta = quanto cada filtro mudou desde `prev`. O painel desenha isso."""
     try:
         w = trainer.model.model[0].conv.weight.detach().float().cpu()
         if w.shape[1] != 3:
-            return None
-        w = ((w - w.min()) / (w.max() - w.min() + 1e-8) * 255).round().byte()
-        return {'k': int(w.shape[-1]), 'tiles': w.permute(0, 2, 3, 1).tolist()}
+            return None, None
+        flat = w.flatten(1)
+        lo, hi = flat.min(1, keepdim=True).values, flat.max(1, keepdim=True).values
+        tiles = ((flat - lo) / (hi - lo + 1e-8) * 255).round().byte().view_as(w)
+        delta = (w - prev).flatten(1).norm(dim=1).tolist() if prev is not None and prev.shape == w.shape else None
+        return {'k': int(w.shape[-1]), 'tiles': tiles.permute(0, 2, 3, 1).tolist(), 'delta': delta}, w
     except Exception:
-        return None
+        return None, None
+
+
+def epoch_losses(trainer) -> dict:
+    """Loss média da época. Ultralytics >= 8.4: tloss é dict {nome: valor}; antes era tensor + loss_names."""
+    t = getattr(trainer, 'tloss', None)
+    if t is None:
+        return {}
+    if isinstance(t, dict):
+        return {k: float(v) for k, v in t.items()}
+    names = getattr(trainer, 'loss_names', None) or ('box_loss', 'cls_loss', 'dfl_loss')
+    return dict(zip(names, torch.as_tensor(t).flatten().tolist()))
+
+
+def safe(fn):
+    """Callback de log/painel NUNCA derruba o treino: erro vira aviso."""
+    def wrapped(trainer):
+        try:
+            fn(trainer)
+        except Exception as e:  # noqa: BLE001
+            print(f'⚠️ callback {fn.__name__} falhou ({type(e).__name__}: {e}) — treino continua')
+    wrapped.__name__ = fn.__name__
+    return wrapped
 
 
 def make_callbacks(target_map: float, cls_weights, events: str = ''):
@@ -117,8 +192,8 @@ def make_callbacks(target_map: float, cls_weights, events: str = ''):
 
     def on_train_start(trainer):
         state['prev'] = snapshot(trainer)
-        emit(events, type='start', epochs=trainer.epochs, device=str(trainer.device), target=target_map,
-             filters=first_layer_filters(trainer))
+        filt, state['w1'] = first_layer_filters(trainer)
+        emit(events, type='start', epochs=trainer.epochs, device=str(trainer.device), target=target_map, filters=filt)
         if cls_weights:
             # Ultralytics não tem arg 'class_weights': injeta no BCE da loss de classificação.
             # (BCEWithLogitsLoss.weight shape (nc,) faz broadcast sobre (batch, anchors, nc).)
@@ -133,7 +208,7 @@ def make_callbacks(target_map: float, cls_weights, events: str = ''):
         delta = sum(((c - p) ** 2).sum().item() for c, p in zip(cur, state['prev'])) ** 0.5
         norm = sum((c ** 2).sum().item() for c in cur) ** 0.5
         state['prev'] = cur
-        losses = dict(zip(trainer.loss_names, trainer.tloss.tolist())) if trainer.tloss is not None else {}
+        losses = epoch_losses(trainer)
         loss = ' '.join(f'{k}={v:.3f}' for k, v in losses.items())
         state.update(loss=losses, delta=delta, delta_pct=100 * delta / norm)
         print(f'🧠 época {trainer.epoch + 1}: loss[{loss}] | Δpesos={delta:.4f} ({100 * delta / norm:.2f}% da norma)')
@@ -151,17 +226,18 @@ def make_callbacks(target_map: float, cls_weights, events: str = ''):
                   f'(mAP50 {prev:.3f} -> {map50:.3f}) — pesos {"reforçados" if ok else "corrigidos pelo gradiente"}')
         state['map50'] = map50
         m = trainer.metrics
+        filt, state['w1'] = first_layer_filters(trainer, state.get('w1'))
         emit(events, type='epoch', epoch=trainer.epoch + 1, epochs=trainer.epochs, verdict=verdict, prev_map50=prev,
              map50=map50, map5095=m.get('metrics/mAP50-95(B)'), precision=m.get('metrics/precision(B)'),
              recall=m.get('metrics/recall(B)'), loss=state.get('loss', {}), delta=state.get('delta'),
-             delta_pct=state.get('delta_pct'), filters=first_layer_filters(trainer))
+             delta_pct=state.get('delta_pct'), filters=filt)
         if map50 >= target_map:
             print(f'✅ mAP50 {map50:.3f} >= {target_map:.3f} — parando')
             emit(events, type='goal', map50=map50)
             trainer.stop = True
 
-    return {'on_train_start': on_train_start, 'on_train_epoch_end': on_train_epoch_end,
-            'on_fit_epoch_end': on_fit_epoch_end}
+    return {'on_train_start': safe(on_train_start), 'on_train_epoch_end': safe(on_train_epoch_end),
+            'on_fit_epoch_end': safe(on_fit_epoch_end)}
 
 
 def main():
@@ -169,6 +245,7 @@ def main():
     root = Path(__file__).parent.parent
     device = select_device(args.device, args.require_cuda)
     print(f'Usando device: {device}')
+    apply_vram_limit(device, args.vram_gb)
 
     cls_weights = None
     if args.cls_weight:
@@ -177,7 +254,7 @@ def main():
         if cls_weights is None:
             print('⚠️ sem anotações para calcular class weights; ignorando')
 
-    start = find_start_weight(root, args.model)
+    start = args.model or find_start_weight(root, 'yolov8s.pt')
     print(f'🔁 Ponto de partida: {start}')
     model = YOLO(start)
     for event, fn in make_callbacks(args.target_map, cls_weights, args.events).items():
@@ -192,7 +269,7 @@ def main():
     kwargs = dict(data=args.data, epochs=args.max_epochs, imgsz=args.imgsz, batch=args.batch,
                   device=device, name=args.run_name, exist_ok=True, patience=args.patience,
                   cos_lr=True, freeze=args.freeze or None, close_mosaic=10,
-                  cache=False if args.cache == 'false' else args.cache, workers=args.workers)
+                  cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=args.workers)
     if args.lr0:
         kwargs['lr0'] = args.lr0
     model.train(**kwargs)

@@ -76,9 +76,12 @@
   .readout{position:absolute;top:0;left:0;font-size:12px;color:var(--ink);pointer-events:none}
   .cols>div>.label:first-child{display:flex;justify-content:space-between;gap:12px;margin-bottom:12px}
   .cols{display:grid;grid-template-columns:1fr 1.2fr;gap:32px}
-  .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(52px,1fr));gap:6px}
-  .tile{aspect-ratio:1;image-rendering:pixelated;width:100%;background:
-    repeating-linear-gradient(45deg,var(--rule) 0 3px,transparent 3px 6px)}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(56px,1fr));gap:16px 14px;padding:4px}
+  .neuron{--heat:0;position:relative;aspect-ratio:1;border-radius:50%;overflow:hidden;background:var(--panel);
+    box-shadow:0 0 0 1px color-mix(in srgb,var(--reward) calc(var(--heat)*100%),var(--rule)),0 0 0 4px var(--bg),0 0 0 0 transparent}
+  .neuron canvas{width:100%;height:100%;display:block}
+  .neuron::after{content:"";position:absolute;inset:0;border-radius:50%;
+    background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.30),transparent 42%),radial-gradient(circle,transparent 52%,rgba(0,0,0,.5))}
   .spark{margin-top:14px;display:flex;align-items:flex-end;gap:2px;height:44px}
   .spark i{flex:1;background:var(--dim);min-height:1px}
   .spark i:last-child{background:var(--ink)}
@@ -109,8 +112,11 @@
     <form class="controls" id="form" autocomplete="off">
       <label class="field"><span class="label">Alvo mAP50</span><input id="target" type="number" min="0.05" max="0.99" step="0.01" value="0.60"></label>
       <label class="field"><span class="label">Épocas máx.</span><input id="epochs" type="number" min="1" max="1000" value="300"></label>
+      <label class="field"><span class="label">Batch</span><input id="batch" type="number" min="1" max="128" value="16"></label>
+      <label class="field" title="0 = automático (60% da RAM livre)"><span class="label">RAM cache GB</span><input id="ram" type="number" min="0" max="1024" step="1" value="0"></label>
+      <label class="field" title="0 = sem limite"><span class="label">VRAM GB</span><input id="vram" type="number" min="0" max="256" step="1" value="0"></label>
       <label class="field"><span class="label">Modelo</span>
-        <select id="model"><option value="models/yolov8n.pt">yolov8n · rápido</option><option value="models/yolov8s.pt">yolov8s · preciso</option></select></label>
+        <select id="model"><option value="">(nenhum .pt em models/)</option></select></label>
       <button class="btn" id="go" type="submit">Iniciar</button>
     </form>
   </header>
@@ -179,7 +185,8 @@ $('form').addEventListener('submit', async e => {
   const btn = $('go'); btn.disabled = true;
   try{
     if(S.running) await api('/api/stop');
-    else await api('/api/start', {target:+$('target').value, max_epochs:+$('epochs').value, model:$('model').value});
+    else if(!$('model').value) throw new Error('coloque um modelo .pt na pasta models/');
+    else await api('/api/start', {target:+$('target').value, max_epochs:+$('epochs').value, model:$('model').value, batch:+$('batch').value, ram_gb:+$('ram').value, vram_gb:+$('vram').value});
     banner('', '');
     await poll(true);
   }catch(err){ banner('err', 'Não foi possível: '+err.message); }
@@ -198,7 +205,15 @@ function countTo(el, to){
     el.textContent = (from+(to-from)*e).toFixed(3); if(k<1) requestAnimationFrame(step); })(t0);
 }
 
+function renderModels(){
+  const sel = $('model'), cur = sel.value, ms = S.models || [];
+  if(sel.dataset.sig === ms.join('|')) return;
+  sel.dataset.sig = ms.join('|');
+  sel.replaceChildren(...(ms.length ? ms : ['']).map(m => { const o = document.createElement('option'); o.value = m; o.textContent = m ? m.replace(/^models\//,'') : '(nenhum .pt em models/)'; return o; }));
+  if(ms.includes(cur)) sel.value = cur;
+}
 function render(){
+  renderModels();
   const ev = S.events, eps = ev.filter(e=>e.type==='epoch'), start = ev.find(e=>e.type==='start'),
         last = eps[eps.length-1], goal = ev.some(e=>e.type==='goal');
   const total = (last||start||{}).epochs, target = (start||{}).target ?? +$('target').value;
@@ -259,21 +274,30 @@ function render(){
 
 function renderTiles(src){
   const f = src && src.filters; if(!f) return;
-  const n = f.tiles.length, k = f.k;
+  const n = f.tiles.length, k = f.k, SZ = 64;
   if(tileEls.length !== n){
-    $('tiles').replaceChildren(...(tileEls = f.tiles.map(()=>{ const c=document.createElement('canvas'); c.width=c.height=k; c.className='tile'; return c; })));
+    $('tiles').replaceChildren(...(tileEls = f.tiles.map(()=>{
+      const d = document.createElement('div'), c = document.createElement('canvas');
+      d.className = 'neuron'; c.width = c.height = SZ; d.append(c); return d; })));
   }
-  $('tileinfo').textContent = `${n} filtros ${k}×${k}`;
-  f.tiles.forEach((t, i)=>{
-    const ctx = tileEls[i].getContext('2d'), img = ctx.createImageData(k,k);
-    let diff = 0;
-    for(let y=0;y<k;y++)for(let x=0;x<k;x++){ const p=(y*k+x)*4, px=t[y][x];
-      img.data[p]=px[0];img.data[p+1]=px[1];img.data[p+2]=px[2];img.data[p+3]=255;
-      if(prevTiles) diff += Math.abs(px[0]-prevTiles[i][y][x][0]); }
-    ctx.putImageData(img,0,0);
-    if(!reduce && prevTiles && diff > k*k*2) tileEls[i].animate([{boxShadow:`0 0 0 2px ${css('--reward')}`},{boxShadow:'0 0 0 0 transparent'}],{duration:900});
+  const off = renderTiles.off || (renderTiles.off = document.createElement('canvas'));
+  off.width = off.height = k; const octx = off.getContext('2d');
+  const fresh = renderTiles.epoch !== src.epoch || renderTiles.n !== n;
+  renderTiles.epoch = src.epoch; renderTiles.n = n;
+  const dmax = Math.max(...(f.delta || [0]), 1e-12);
+  const glow = d => `0 0 0 1px rgba(200,255,46,${.2+.8*d}),0 0 0 4px ${css('--bg')},0 0 ${4+24*d}px ${1+7*d}px rgba(200,255,46,${.55*d})`;
+  f.tiles.forEach((t, i) => {
+    const img = octx.createImageData(k, k);
+    for(let y=0;y<k;y++) for(let x=0;x<k;x++){ const px = t[y][x]; img.data.set([px[0],px[1],px[2],255], (y*k+x)*4); }
+    octx.putImageData(img, 0, 0);
+    const cx = tileEls[i].firstChild.getContext('2d'); cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+    cx.drawImage(off, 0, 0, SZ, SZ);   // 3×3 -> 64×64 interpolado: gradiente liso em vez de pixels
+    const d = f.delta ? f.delta[i] / dmax : 0;
+    tileEls[i].style.setProperty('--heat', d.toFixed(3));
+    tileEls[i].title = `neurônio ${i+1}` + (f.delta ? ` · mudou ${(100*d).toFixed(0)}% do que o mais ativo mudou` : '');
+    if(fresh && !reduce && f.delta) tileEls[i].animate([{boxShadow: glow(d)}, {boxShadow: glow(0)}], {duration: 1100, easing: 'ease-out'});
   });
-  prevTiles = f.tiles;
+  $('tileinfo').textContent = `${n} filtros ${k}×${k} · brilho = Δ`;
 }
 
 function renderTable(eps){
