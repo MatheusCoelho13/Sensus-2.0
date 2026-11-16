@@ -14,7 +14,9 @@ chunks que reiniciavam o agendamento de LR a cada N épocas.
 """
 
 import argparse
+import json
 import shutil
+import time
 from pathlib import Path
 
 import torch
@@ -45,6 +47,7 @@ def parse_args():
     p.add_argument('--fast-validate', action='store_true', help='validação final em resolução/batch menores')
     p.add_argument('--skip-validate', action='store_true', help='pula validação final de models/best.pt')
     p.add_argument('--run-name', default=DEFAULT_RUN_NAME)
+    p.add_argument('--events', default='', help='arquivo .jsonl p/ o painel (scripts/train_ui.py) acompanhar o treino')
     return p.parse_args()
 
 
@@ -87,7 +90,25 @@ def validate(weight: Path, data: str, imgsz: int, batch: int, device: str, fast:
     return float(m.box.map50)
 
 
-def make_callbacks(target_map: float, cls_weights):
+def emit(path: str, **ev):
+    if path:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({**ev, 't': time.time()}) + '\n')
+
+
+def first_layer_filters(trainer):
+    """Pesos da 1ª camada conv como tiles RGB 0-255 (o painel desenha os "neurônios" mudando)."""
+    try:
+        w = trainer.model.model[0].conv.weight.detach().float().cpu()
+        if w.shape[1] != 3:
+            return None
+        w = ((w - w.min()) / (w.max() - w.min() + 1e-8) * 255).round().byte()
+        return {'k': int(w.shape[-1]), 'tiles': w.permute(0, 2, 3, 1).tolist()}
+    except Exception:
+        return None
+
+
+def make_callbacks(target_map: float, cls_weights, events: str = ''):
     """Callbacks que mostram o aprendizado acontecendo + aplicam peso de classe + early-stop."""
     state = {'prev': None}
 
@@ -96,6 +117,8 @@ def make_callbacks(target_map: float, cls_weights):
 
     def on_train_start(trainer):
         state['prev'] = snapshot(trainer)
+        emit(events, type='start', epochs=trainer.epochs, device=str(trainer.device), target=target_map,
+             filters=first_layer_filters(trainer))
         if cls_weights:
             # Ultralytics não tem arg 'class_weights': injeta no BCE da loss de classificação.
             # (BCEWithLogitsLoss.weight shape (nc,) faz broadcast sobre (batch, anchors, nc).)
@@ -110,14 +133,31 @@ def make_callbacks(target_map: float, cls_weights):
         delta = sum(((c - p) ** 2).sum().item() for c, p in zip(cur, state['prev'])) ** 0.5
         norm = sum((c ** 2).sum().item() for c in cur) ** 0.5
         state['prev'] = cur
-        loss = ' '.join(f'{k}={v:.3f}' for k, v in
-                        zip(trainer.loss_names, trainer.tloss.tolist())) if trainer.tloss is not None else ''
+        losses = dict(zip(trainer.loss_names, trainer.tloss.tolist())) if trainer.tloss is not None else {}
+        loss = ' '.join(f'{k}={v:.3f}' for k, v in losses.items())
+        state.update(loss=losses, delta=delta, delta_pct=100 * delta / norm)
         print(f'🧠 época {trainer.epoch + 1}: loss[{loss}] | Δpesos={delta:.4f} ({100 * delta / norm:.2f}% da norma)')
 
     def on_fit_epoch_end(trainer):
         map50 = trainer.metrics.get('metrics/mAP50(B)', 0.0)
+        # "recompensa/punição" = o erro (loss) guiando o ajuste dos pesos; aprendizado supervisionado,
+        # não RL. Aqui só mostramos se a época foi pra frente (acertou mais) ou pra trás (errou mais).
+        prev = state.get('map50')
+        verdict = None
+        if prev is not None and map50 != prev:
+            ok = map50 > prev
+            verdict = 'reward' if ok else 'punish'
+            print(f'{"🏆 RECOMPENSA: acertou mais" if ok else "⚠️ PUNIÇÃO: errou mais"} '
+                  f'(mAP50 {prev:.3f} -> {map50:.3f}) — pesos {"reforçados" if ok else "corrigidos pelo gradiente"}')
+        state['map50'] = map50
+        m = trainer.metrics
+        emit(events, type='epoch', epoch=trainer.epoch + 1, epochs=trainer.epochs, verdict=verdict, prev_map50=prev,
+             map50=map50, map5095=m.get('metrics/mAP50-95(B)'), precision=m.get('metrics/precision(B)'),
+             recall=m.get('metrics/recall(B)'), loss=state.get('loss', {}), delta=state.get('delta'),
+             delta_pct=state.get('delta_pct'), filters=first_layer_filters(trainer))
         if map50 >= target_map:
             print(f'✅ mAP50 {map50:.3f} >= {target_map:.3f} — parando')
+            emit(events, type='goal', map50=map50)
             trainer.stop = True
 
     return {'on_train_start': on_train_start, 'on_train_epoch_end': on_train_epoch_end,
@@ -140,7 +180,7 @@ def main():
     start = find_start_weight(root, args.model)
     print(f'🔁 Ponto de partida: {start}')
     model = YOLO(start)
-    for event, fn in make_callbacks(args.target_map, cls_weights).items():
+    for event, fn in make_callbacks(args.target_map, cls_weights, args.events).items():
         model.add_callback(event, fn)
 
     best_pt = root / 'models' / 'best.pt'
