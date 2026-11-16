@@ -22,9 +22,9 @@ JavaScript
 WebXR
 API de captura de mídia (getUserMedia)
 Backend
-Java
-Spring Boot
-API REST
+Node.js + TypeScript
+Fastify
+API REST + WebSocket
 Inteligência Artificial
 Python
 Bibliotecas de visão computacional
@@ -58,14 +58,14 @@ Essa abordagem facilita o desenvolvimento em equipe e evita conflitos entre dife
 
 Para rodar o projeto, siga os passos:
 
-Inicie o backend (Java com Spring Boot)
+Inicie o backend (Node.js + TypeScript): `npm install` na raiz e `npm run dev -w apps/backend-api`
 Inicie o serviço de IA (Python)
 Execute o frontend no navegador do dispositivo XR
 Certifique-se de que todos os serviços estão na mesma rede
 
 ## 📋 Requisitos
 Dispositivo com suporte a WebXR (ex: Meta Quest)
-Ambiente Java configurado
+Node.js 22+
 Ambiente Python configurado
 Conexão em rede entre os serviços
 
@@ -76,3 +76,22 @@ Este projeto foi desenvolvido como parte da disciplina de Soluções Web, com o 
 ## 👨‍💻 Autores
 
 Projeto desenvolvido para fins acadêmicos.
+
+
+## Variáveis de ambiente (backend)
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `PORT` | `8080` | Porta HTTP/WS |
+| `DATABASE_URL` | — | `postgres://user:pass@host:5432/db`. Sem ela o backend roda sem persistência. Fallback legado: `SPRING_DATASOURCE_URL` + `DB_USER` + `DB_PASS` |
+| `IA_SERVICE_URL` | `http://ia-service:8000` | Serviço de IA |
+| `IA_TIMEOUT_MS` | `5000` | Timeout da inferência |
+| `RATE_LIMIT_FPS` | `5` | Frames/s por sessão |
+| `PERSISTENCE_ENABLED` | `true` | `false` desliga gravação no banco |
+| `RELEVANT_CLASSES` | ver API.md | Classes devolvidas ao cliente |
+| `WEBSOCKET_MAX_PAYLOAD_SIZE` | `524288` | Bytes por mensagem WS |
+| `ELEVENLABS_API_KEY` / `_VOICE_ID` / `_MODEL` | — | TTS |
+| `LOG_LEVEL` | `info` | Nível do logger |
+
+Comandos (a partir da raiz do monorepo): `npm run dev|build|test|typecheck -w apps/backend-api`.
+Migrações SQL em `migrations/` rodam automaticamente no boot.

@@ -176,7 +176,6 @@ Default:
 Required variables:
 
 ```txt
-SPRING_PROFILES_ACTIVE
 DATABASE_URL
 REDIS_URL
 AI_SERVICE_URL

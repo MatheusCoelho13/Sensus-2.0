@@ -12,7 +12,7 @@ The system uses:
 * YOLO-based object detection
 * WebSocket streaming
 * React WebXR frontend
-* Spring Boot realtime backend
+* Node.js/TypeScript realtime backend (Fastify)
 * FastAPI AI inference service
 
 The project follows:
@@ -73,9 +73,9 @@ Responsibilities:
 
 Stack:
 
-* Spring Boot
-* Spring WebFlux
-* WebSocket
+* Node.js 22 + TypeScript
+* Fastify
+* WebSocket (ws)
 * PostgreSQL
 * Redis
 

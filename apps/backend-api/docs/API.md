@@ -89,12 +89,13 @@ Lista o histórico de análises em ordem decrescente de timestamp.
 | Parâmetro | Tipo    | Padrão | Descrição                          |
 |-----------|---------|--------|------------------------------------|
 | `page`    | integer | 0      | Número da página (base 0)          |
-| `size`    | integer | 20     | Itens por página                   |
-| `sort`    | string  | timestamp | Campo de ordenação              |
+| `size`    | integer | 20     | Itens por página (1–100)           |
+
+Ordenação fixa: `timestamp` decrescente.
 
 **Response `200 OK`**
 
-Retorna um objeto `Page` do Spring:
+Retorna uma página (`content`, `totalElements`, `totalPages`, `size`, `number`):
 
 ```json
 {
@@ -177,14 +178,14 @@ Verifica a saúde do backend e do serviço de IA.
 
 ---
 
-### GET /actuator/health
+### GET /api/health  (alias: /actuator/health)
 
-Health check para Docker e orquestração.
+Health check para Docker e orquestração. Sempre `200` enquanto o processo vive; o estado da IA vem à parte.
 
 **Response `200 OK`**
 
 ```json
-{ "status": "UP" }
+{ "status": "UP", "ia": "UP", "websocket": { "activeSessions": 0 } }
 ```
 
 ---
@@ -194,10 +195,10 @@ Health check para Docker e orquestração.
 ### Endpoint
 
 ```
-ws://localhost:8080/ws
+ws://localhost:8080/ws/realtime
 ```
 
-SockJS disponível como fallback no mesmo endpoint.
+WebSocket puro (sem SockJS/Socket.IO). Limite de payload: `WEBSOCKET_MAX_PAYLOAD_SIZE` (padrão 512KB).
 
 ### Envio de frame (cliente → servidor)
 
@@ -231,13 +232,18 @@ Envie os bytes da imagem diretamente como mensagem binária WebSocket.
 **Resposta de erro (IA indisponível)**
 
 ```json
-{ "erro": "IA indisponível" }
+{ "type": "error", "code": "INFERENCE_ERROR", "message": "IA indisponível", "timestamp": 1711370000000, "erro": "IA indisponível" }
 ```
+
+`erro` é o campo legado lido pelo frontend atual; os demais seguem `ErrorResponse` (shared-contracts). JSON malformado responde o mesmo formato com `code: "INVALID_PAYLOAD"`.
+
+**Heartbeat:** `{ "type": "heartbeat", "timestamp": ... }` é aceito e não gera resposta.
 
 ### Rate Limiting
 
-- Máximo de **5 frames/segundo** por sessão (configurável via `app.rate-limit.fps`).
+- Máximo de **5 frames/segundo** por sessão (configurável via `RATE_LIMIT_FPS`).
 - Frames excedentes são descartados silenciosamente — nenhuma resposta de erro é enviada ao cliente.
+- Apenas **1 frame em processamento por sessão**: frames que chegam durante a inferência também são descartados (evita fila e latência acumulada).
 
 ---
 
@@ -258,9 +264,9 @@ Envie os bytes da imagem diretamente como mensagem binária WebSocket.
 
 ### Classes filtradas
 
-Somente as classes configuradas em `app.filtro.classes-relevantes` são retornadas.
+Somente as classes configuradas em `RELEVANT_CLASSES` (lista separada por vírgula) são retornadas.
 
-Padrão: `person`, `chair`, `table`, `door`, `stairs`, `car`.
+Padrão: `person`, `chair`, `dining table`, `door`, `stairs`, `car`, `cell phone`, `backpack`.
 
 ---
 

@@ -25,15 +25,12 @@ services:
   # ─── Backend API ──────────────────────────────────────────────────────────
   backend-api:
     build:
-      context: ./apps/backend-api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: apps/backend-api/Dockerfile
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     environment:
-      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE:-prod}
-      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/${POSTGRES_DB:-visaoassistiva}
-      - DB_USER=${POSTGRES_USER:-postgres}
-      - DB_PASS=${POSTGRES_PASSWORD:-postgres}
+      - DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-visaoassistiva}
       - IA_SERVICE_URL=http://ia-service:8000
       - WEBSOCKET_MAX_PAYLOAD_SIZE=${WEBSOCKET_MAX_PAYLOAD_SIZE:-512000}
       - REDIS_URL=redis://redis:6379
@@ -49,7 +46,7 @@ services:
       - sensus-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/health || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 60s

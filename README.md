@@ -22,12 +22,12 @@ A proposta é transformar o que a câmera enxerga em informação acionável: id
 O Sensus é uma aplicação distribuída em três serviços independentes que se comunicam por rede:
 
 ```
-[Frontend WebXR]  --frames-->  [Backend Spring Boot]  --frames-->  [Serviço de IA / YOLO]
+[Frontend WebXR]  --frames-->  [Backend Node/TS]  --frames-->  [Serviço de IA / YOLO]
    (Meta Quest)   <--boxes--    (orquestração/API)    <--boxes--    (inferência)
 ```
 
 1. **Frontend (WebXR):** captura o vídeo da câmera e renderiza as detecções
-2. **Backend (Spring Boot):** orquestra o fluxo, expõe a API REST e faz a ponte entre o frontend e o serviço de IA
+2. **Backend (Node.js + TypeScript, Fastify):** orquestra o fluxo, expõe a API REST e faz a ponte entre o frontend e o serviço de IA
 3. **IA (Python/YOLO):** roda a inferência sobre os frames e retorna as bounding boxes
 
 Cada serviço sobe isolado e pode ser executado via Docker.
@@ -40,8 +40,9 @@ Cada serviço sobe isolado e pode ser executado via Docker.
 - getUserMedia (captura de mídia)
 
 **Backend**
-- Java
-- Spring Boot
+- Node.js 22
+- TypeScript
+- Fastify
 - API REST
 
 **Inteligência Artificial**
@@ -81,8 +82,8 @@ Essa separação facilita o trabalho em equipe e reduz conflitos entre as camada
 Pré-requisito: todos os serviços precisam estar na mesma rede.
 
 ```bash
-# 1. Backend (Java / Spring Boot)
-cd backend && ./mvnw spring-boot:run
+# 1. Backend (Node.js / TypeScript)
+npm install && npm run dev -w apps/backend-api
 
 # 2. Serviço de IA (Python)
 cd ia && python app.py
@@ -96,7 +97,7 @@ cd ia && python app.py
 ## 📋 Requisitos
 
 - Dispositivo com suporte a WebXR (ex: Meta Quest)
-- Java (JDK) configurado
+- Node.js 22+
 - Python configurado, com as dependências do modelo YOLO instaladas
 - Rede compartilhada entre os três serviços
 
