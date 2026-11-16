@@ -18,10 +18,12 @@ MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB) --workers $(WORKE
 PY = $(if $(wildcard .venv/bin/activate),. .venv/bin/activate && python3,python3)
 
 .DEFAULT_GOAL := help
-.PHONY: help tui painel dataset treinar train_coco coco relatorio publicar
+.PHONY: help instalar verificar tui painel dataset treinar train_coco coco relatorio publicar
 
 help:
 	@echo "Sensus IA - comandos:"
+	@echo "  make instalar    - cria o venv e instala tudo que precisa (make instalar CPU=1 = torch leve, só CPU) e confere no fim"
+	@echo "  make verificar   - confere se o ambiente está pronto (pacotes, GPU, modelos, dataset)"
 	@echo "  make tui         - interface no terminal (inicia/para o treino, gráficos ao vivo)"
 	@echo "  make painel      - interface gráfica no navegador (http://127.0.0.1:8765)"
 	@echo "  make dataset     - baixa o COCO (10 classes) e balanceia (PER_CLASS=1000 VAL_PER_CLASS=200)"
@@ -32,6 +34,12 @@ help:
 	@echo "  make relatorio   - relatório com matriz de confusão por classe (WEIGHTS=models/best.pt); também sai no fim do treino"
 	@echo "  parada: EPOCHS=300 PATIENCE=100 TARGET=0.60  (para quando acabam as épocas, ou mAP50 >= TARGET, ou PATIENCE épocas sem melhorar)"
 	@echo "  recursos (0 = máximo, padrão): BATCH= RAM_GB= VRAM_GB= WORKERS=   Ex: make treinar VRAM_GB=4 BATCH=8"
+
+instalar:
+	CPU=$(CPU) bash scripts/instalar.sh
+
+verificar:
+	$(PY) scripts/verify_env.py
 
 tui:
 	$(PY) scripts/train_tui.py
