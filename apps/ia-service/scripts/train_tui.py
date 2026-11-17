@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -119,6 +120,7 @@ class UI:
         self.msg_until, self.show_help, self.show_sys = 0.0, False, False
         self.mon = sysmon.SysMon()
         self.hot, self.hot_seen, self.thermal_stop = 0, None, False
+        self.ask, self.busy, self.was_running, self.msg_pair = None, None, False, PUNISH   # ask: 'report' | 'publish' | None
         self.target, self.epochs, self.model = 0.60, 300, ''
         self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
         self.quitting = False
@@ -219,8 +221,57 @@ class UI:
             self.put(y, 2, f' {label} ', DIM)
 
     # ---------- ações ----------
-    def say(self, text, secs=6):
-        self.msg, self.msg_until = text, time.time() + secs
+    def say(self, text, secs=6, pair=PUNISH):
+        self.msg, self.msg_until, self.msg_pair = text, time.time() + secs, pair
+
+    # ---------- pós-treino: relatório + publicar no GitHub (sempre perguntando) ----------
+    PROMPTS = {'report': 'Treino acabou. Gerar o relatório com matriz de confusão por classe?  [s] sim  [n] não',
+               'publish': 'Commitar e subir esta run no GitHub (só models/best.pt + o relatório, nada além)?  [s] sim  [n] não'}
+
+    def after_training(self):
+        """Chamado quando o treino acaba: pergunta o que fazer. O train.py já gera o relatório se terminou por conta própria."""
+        has_weights = any(f['name'] == 'weights/best.pt' for f in self.S.get('files') or [])
+        if self.quitting or not has_weights:
+            return
+        made_report = any(e['type'] == 'report' for e in self.S['events'])
+        self.ask = 'publish' if made_report else 'report'
+
+    def answer(self, yes):
+        stage, self.ask = self.ask, None
+        if stage == 'report':
+            if not yes:
+                self.ask = 'publish'
+                return
+            w = core.ROOT / 'models' / 'best.pt'
+            if not w.exists():
+                w = core.run_dir(self.S['events']) / 'weights' / 'best.pt'
+            self.run_post('relatório', [sys.executable, 'scripts/report.py', '--weights', str(w),
+                                        '--data', 'config/data.yaml', '--imgsz', '640'], next_ask='publish')
+        elif stage == 'publish':
+            if yes:
+                self.run_post('publicação no GitHub', [sys.executable, 'scripts/publish.py'])
+            else:
+                self.say('ok: nada foi enviado. Quando quiser: make publicar', 10, DIM)
+
+    def run_post(self, label, cmd, next_ask=None):
+        """Roda o comando numa thread (a TUI não trava) e avisa o resultado."""
+        self.busy = f'{label}: rodando… (pode levar alguns minutos; o treino já acabou)'
+
+        def work():
+            try:
+                r = subprocess.run(cmd, cwd=core.ROOT, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                   env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+                lines = [ln for ln in (r.stdout + '\n' + r.stderr).strip().splitlines() if ln.strip()]
+                ok, tail = r.returncode == 0, (lines[-1] if lines else '')
+            except OSError as e:
+                ok, tail = False, str(e)
+            self.busy = None
+            if ok:
+                self.say(f'{label}: pronto. {tail}', 3600, REWARD)
+                self.ask = next_ask
+            else:
+                self.say(f'erro em {label}: {tail} (veja: make {"relatorio" if "relat" in label else "publicar"})', 3600)
+        threading.Thread(target=work, daemon=True).start()
 
     def ask_number(self, label, current, lo, hi):
         """Digite o número na linha de baixo e Enter (Esc cancela)."""
@@ -265,6 +316,15 @@ class UI:
             self.say(f'erro: {e}')
 
     def key(self, k):
+        if self.ask and k not in (ord('q'), ord('Q')):   # pergunta pós-treino: só s/n (Esc = não)
+            if k in (ord('s'), ord('S'), ord('y'), ord('Y')):
+                self.answer(True)
+            elif k in (ord('n'), ord('N'), 27):
+                self.answer(False)
+            return True
+        if self.busy and k in (ord('s'), ord('S')):
+            self.say('aguarde: ainda executando o passo anterior…')
+            return True
         if k == ord('?'):
             self.show_help = not self.show_help
             return True
@@ -500,7 +560,11 @@ class UI:
         if S.get('report_ready') and not S['running'] and not ban:
             ban = 'Relatório com matriz de confusão pronto: tecla o abre no navegador (runs/report/latest.html)'
         if self.msg and time.time() < self.msg_until:
-            ban, bp = self.msg, PUNISH
+            ban, bp = self.msg, self.msg_pair
+        if self.busy:
+            ban, bp = self.busy, L1
+        elif self.ask:
+            ban, bp = self.PROMPTS[self.ask], REWARD
         files = S.get('files') or []
         if files and not S['running']:
             self.put(h - 3, 1, ('Arquivos do run: ' + ' · '.join(f'{f["name"]} {f["size"] / 1e6:.1f}MB' if f['size'] > 1e6 else f'{f["name"]}' for f in files)
@@ -640,6 +704,9 @@ class UI:
                 self.S, self.last_poll = core.state(), now
                 if self.quitting and not self.S['running']:
                     return
+                if self.was_running and not self.S['running']:
+                    self.after_training()
+                self.was_running = self.S['running']
                 if self.model not in self.S['models']:
                     self.model = self.S['models'][0] if self.S['models'] else ''
                 if self.msg and time.time() > self.msg_until:
