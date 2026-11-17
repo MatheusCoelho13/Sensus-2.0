@@ -392,6 +392,7 @@ def main():
         model.add_callback(event, fn)
 
     kwargs = dict(data=args.data, epochs=args.max_epochs, imgsz=args.imgsz, batch=train_batch,
+                  project=str(root / 'runs' / 'detect'),   # sem isso o Ultralytics grava em <raiz do repo>/runs, fora do ia-service
                   device=device, name=args.run_name, exist_ok=True, patience=args.patience,
                   cos_lr=True, freeze=args.freeze or None, close_mosaic=10,
                   cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=resolve_workers(args.workers))
@@ -401,9 +402,16 @@ def main():
     elif args.lr0:
         kwargs['lr0'] = args.lr0
     print(f'📅 {args.max_epochs} épocas pedidas · para antes se mAP50 ≥ {args.target_map:.2f} ou {args.patience} épocas sem melhorar')
-    model.train(**kwargs)
+    aborted = False
+    try:
+        model.train(**kwargs)
+    except KeyboardInterrupt:   # 2º sinal de parada (ex: durante a validação final): os pesos já estão salvos em weights/
+        aborted = True
+        print('🛑 abortado na validação final — os pesos do treino já estavam salvos')
     tr = model.trainer
     done, total = tr.epoch + 1, tr.epochs
+    if aborted:
+        STOP['asked'] = True   # cai no caminho "parado pelo usuário" abaixo
     reason = stop_reason(STOP['asked'], STOP['goal'], done, total)
     why = explain_stop(reason, done, total, args.patience, args.target_map)
     print(f'🏁 {why}')
@@ -412,7 +420,14 @@ def main():
     print('💾 ' + ' · '.join(f'{n} ' + (f'OK ({(wdir / n).stat().st_size / 1e6:.1f} MB)' if (wdir / n).exists() else 'NÃO GERADO')
                              for n in ('best.pt', 'last.pt')) + f'  em {wdir}')
     if STOP['asked']:  # parado pelo usuário: pesos já salvos pelo Ultralytics; pula validação/relatório (demoram)
-        print(f'🛑 treino parado. Pesos salvos em {wdir} (best.pt e last.pt)')
+        models_dir = root / 'models'
+        models_dir.mkdir(parents=True, exist_ok=True)
+        if (wdir / 'last.pt').exists():
+            shutil.copy2(wdir / 'last.pt', models_dir / 'last.pt')
+        if (wdir / 'best.pt').exists() and not best_pt.exists():   # nunca sobrescreve um best.pt já validado (sem mAP aqui p/ comparar)
+            shutil.copy2(wdir / 'best.pt', best_pt)
+            print('📦 models/best.pt criado a partir deste run (ainda não validado; make relatorio confere)')
+        print(f'🛑 treino parado. Pesos salvos em {wdir} (best.pt e last.pt) · cópia em models/last.pt')
         emit(args.events, type='stopped', path=str(wdir))
         return
 
