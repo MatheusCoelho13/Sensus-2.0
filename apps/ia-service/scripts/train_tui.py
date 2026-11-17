@@ -57,7 +57,11 @@ try:
     MAX_TEMP = int(os.environ.get('MAX_TEMP', '85'))
 except ValueError:
     MAX_TEMP = 85
-HOT_SAMPLES = 2   # leituras seguidas >= MAX_TEMP (a GPU é lida a cada 2s) — ignora picos de 1 amostra
+try:
+    MAX_CPU_TEMP = int(os.environ.get('MAX_CPU_TEMP', '95'))   # só vale se a CPU tiver sensor (Linux nativo ou LibreHardwareMonitor)
+except ValueError:
+    MAX_CPU_TEMP = 95
+HOT_SAMPLES = 2  # leituras seguidas >= MAX_TEMP (a GPU é lida a cada 2s) — ignora picos de 1 amostra
 
 
 def rgb_to_xterm(r, g, b):
@@ -383,19 +387,23 @@ class UI:
         if not MAX_TEMP or not self.S['running']:
             self.hot, self.hot_seen, self.thermal_stop = 0, None, False
             return
-        g = self.mon.snapshot()['data'].get('gpu')
-        t = g and g.get('temp')
-        if t is None or self.thermal_stop:
+        d = self.mon.snapshot()['data']
+        g = d.get('gpu')
+        gt, ct = g and g.get('temp'), d.get('cpu_temp')
+        if (gt is None and ct is None) or self.thermal_stop:
             return
-        # só conta uma leitura nova da GPU: mudou o valor ou passaram 2s desde a última contagem
+        # a cada 2s: conta uma leitura quente se GPU >= MAX_TEMP ou CPU >= MAX_CPU_TEMP
         now = time.time()
         if self.hot_seen is None or now - self.hot_seen >= 2.0:
             self.hot_seen = now
-            self.hot = self.hot + 1 if t >= MAX_TEMP else 0
+            hot_g = gt is not None and gt >= MAX_TEMP
+            hot_c = bool(MAX_CPU_TEMP) and ct is not None and ct >= MAX_CPU_TEMP
+            self.hot = self.hot + 1 if (hot_g or hot_c) else 0
+            self.hot_what = f'GPU em {gt:.0f}°C (limite {MAX_TEMP}°C)' if hot_g else f'CPU em {ct:.0f}°C (limite {MAX_CPU_TEMP}°C)'
         if self.hot >= HOT_SAMPLES:
             self.thermal_stop = True
             core.stop()
-            self.say(f'🔥 GPU em {t:.0f}°C (limite {MAX_TEMP}°C): parando o treino — termina a época e salva best.pt/last.pt. '
+            self.say(f'🔥 {self.hot_what}: parando o treino — termina a época e salva best.pt/last.pt. '
                      f'Deixe esfriar e inicie de novo (s).', 3600)
 
     def run_btop(self):
@@ -623,10 +631,11 @@ class UI:
         y += 1
         ct = d.get('cpu_temp')
         if ct is not None:
-            row(y, 'temp', ct / 100, f'{ct:5.1f}°C', temp_pair(ct), 'ctemp')
+            src = d.get('cpu_temp_src')
+            row(y, 'temp', ct / 100, f'{ct:5.1f}°C' + (f' · via {src}' if src and src != 'linux' else ''), temp_pair(ct), 'ctemp')
         else:
             self.put(y, 2, 'temp  ', INK, True)
-            self.put(y, 9, 'n/d — o WSL não expõe a temperatura da CPU (no Linux nativo aparece aqui)', DIM)
+            self.put(y, 9, 'n/d — no Windows abra o LibreHardwareMonitor (admin) > Options > Remote Web Server'[: w - 11], DIM)
         y += 1
         if d.get('cores'):
             self.put(y, 2, 'cores ', INK, True)

@@ -5,11 +5,14 @@ Amostra numa thread própria (nunca bloqueia o desenho da TUI). Linux/WSL.
 Sem sensor disponível o valor fica None (ex: o WSL não expõe a temperatura da CPU).
 """
 import glob
+import json
 import os
+import re
 import shutil
 import subprocess
 import threading
 import time
+import urllib.request
 from collections import deque
 
 HIST = 120  # amostras guardadas por série (~2 min a 1 Hz)
@@ -48,6 +51,43 @@ def cpu_temp():
     return max(temps) if temps else None
 
 
+LHM_PORT = 8085   # LibreHardwareMonitor > Options > Remote Web Server (porta padrão)
+LHM_PACKAGE = ('package', 'tctl', 'tdie')   # nomes que representam a CPU inteira (Intel / AMD)
+
+
+def lhm_urls() -> list:
+    """Onde o servidor do LibreHardwareMonitor (rodando no Windows) pode estar, visto do WSL."""
+    urls = []
+    if os.environ.get('LHM_URL'):
+        urls.append(os.environ['LHM_URL'])
+    urls.append(f'http://localhost:{LHM_PORT}/data.json')   # WSL2 em modo espelhado (mirrored)
+    for ln in _read('/etc/resolv.conf').splitlines():       # WSL2 padrão: o host Windows é o nameserver
+        p = ln.split()
+        if len(p) == 2 and p[0] == 'nameserver':
+            urls.append(f'http://{p[1]}:{LHM_PORT}/data.json')
+    return list(dict.fromkeys(urls))
+
+
+def parse_lhm(tree: dict):
+    """Temperatura da CPU (°C) a partir do JSON do LibreHardwareMonitor; None se não achar.
+    Prefere 'CPU Package' / 'Core (Tctl/Tdie)'; senão, a maior entre os núcleos."""
+    found = []   # (nome, °C)
+
+    def walk(node, in_cpu):
+        in_cpu = in_cpu or 'cpu' in str(node.get('ImageURL', '')).lower()
+        val = str(node.get('Value', ''))
+        if in_cpu and '°C' in val:
+            m = re.search(r'-?\d+(?:[.,]\d+)?', val)
+            if m:
+                found.append((str(node.get('Text', '')).lower(), float(m.group().replace(',', '.'))))
+        for c in node.get('Children') or []:
+            walk(c, in_cpu)
+    walk(tree, False)
+    temps = [(n, t) for n, t in found if 0 < t < 150]
+    pkg = [t for n, t in temps if any(k in n for k in LHM_PACKAGE)]
+    return pkg[0] if pkg else (max(t for _, t in temps) if temps else None)
+
+
 def _cpu_times():
     """{'cpu': (idle, total), 'cpu0': ...} a partir de /proc/stat."""
     out = {}
@@ -76,6 +116,7 @@ class SysMon:
         self.data = {}
         self.hist = {k: deque(maxlen=HIST) for k in ('cpu', 'ram', 'ctemp', 'gpu', 'gtemp', 'vram')}
         self._prev, self._gpu, self._gpu_at = None, None, 0.0
+        self._lhm, self._lhm_retry = None, 0.0   # URL do LibreHardwareMonitor que respondeu / quando tentar de novo
         self._smi = shutil.which('nvidia-smi') or next((p for p in ('/usr/lib/wsl/lib/nvidia-smi',) if os.path.exists(p)), None)
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -92,6 +133,21 @@ class SysMon:
         except (OSError, subprocess.SubprocessError, IndexError):
             self._gpu = None
 
+    def _lhm_temp(self):
+        """Temperatura da CPU via LibreHardwareMonitor no Windows. Se ele não está no ar, tenta de novo só a cada 20s."""
+        if time.time() < self._lhm_retry:
+            return None
+        for url in ([self._lhm] if self._lhm else lhm_urls()):
+            try:
+                with urllib.request.urlopen(url, timeout=1.0) as r:
+                    t = parse_lhm(json.load(r))
+                self._lhm = url
+                return t
+            except (OSError, ValueError):   # URLError/timeout/JSON inválido
+                continue
+        self._lhm, self._lhm_retry = None, time.time() + 20
+        return None
+
     def _loop(self):
         while True:
             now, cores, cpu = _cpu_times(), [], None
@@ -103,11 +159,14 @@ class SysMon:
                 cores = [pct(k) for k in sorted((k for k in now if k != 'cpu' and k in self._prev), key=lambda k: int(k[3:]))]
             self._prev = now
             used, total = _ram()
-            ct = cpu_temp()
+            ct, src = cpu_temp(), 'linux'
+            if ct is None:   # WSL: sem sensor no Linux -> pergunta ao LibreHardwareMonitor do Windows
+                ct, src = self._lhm_temp(), 'LibreHardwareMonitor'
             self._sample_gpu()
             g = self._gpu
             with self.lock:
-                self.data = dict(cpu=cpu, cores=cores, ram_used=used, ram_total=total, cpu_temp=ct, gpu=g)
+                self.data = dict(cpu=cpu, cores=cores, ram_used=used, ram_total=total, cpu_temp=ct,
+                                 cpu_temp_src=src if ct is not None else None, gpu=g)
                 for key, val in (('cpu', cpu), ('ram', 100 * used / total if used and total else None), ('ctemp', ct),
                                  ('gpu', g and g['util']), ('gtemp', g and g['temp']),
                                  ('vram', 100 * g['mem_used'] / g['mem_total'] if g and g['mem_used'] is not None and g['mem_total'] else None)):
