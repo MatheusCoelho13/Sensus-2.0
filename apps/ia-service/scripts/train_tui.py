@@ -4,15 +4,19 @@
   make tui
 
 Mesmo motor do painel web (scripts/train_ui.py): sobe o train.py, lê runs/ui/events.jsonl.
-Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v VRAM · m modelo · o relatório · l log · q sair (para o treino)
+Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v VRAM · m modelo · o relatório · l log
+        t sensores (CPU/RAM/GPU/temperaturas, estilo btop) · T abre o btop de verdade · q sair (para o treino)
 """
 import curses
+import shutil
+import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sysmon  # noqa: E402
 import train_ui as core  # noqa: E402
 
 GLYPH = {
@@ -91,10 +95,21 @@ def spark(values: list, width: int) -> str:
     return ''.join(EIGHTHS[max(1, min(8, round(8 * v / mx)))] for v in vs)
 
 
+def spark_abs(values: list, width: int, top: float = 100.0) -> str:
+    """Sparkline numa escala fixa 0..top (percentuais/temperaturas não podem ser relativos ao máximo)."""
+    return ''.join(EIGHTHS[max(1, min(8, round(8 * v / top)))] for v in values[-width:])
+
+
+def temp_pair(t):
+    """Cor da temperatura: verde < 70°C, âmbar < 80°C, vermelho acima."""
+    return DIM if t is None else REWARD if t < 70 else L1 if t < 80 else PUNISH
+
+
 class UI:
     def __init__(self, scr):
         self.scr, self.msg, self.show_log = scr, '', False
-        self.msg_until, self.show_help = 0.0, False
+        self.msg_until, self.show_help, self.show_sys = 0.0, False, False
+        self.mon = sysmon.SysMon()
         self.target, self.epochs, self.model = 0.60, 300, ''
         self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
         self.quitting = False
@@ -285,12 +300,28 @@ class UI:
             if not g:
                 self.say('erro: ainda não há imagens (elas surgem na 1ª época do treino)')
             else:
-                import webbrowser
-                if not webbrowser.open(g.as_uri()):
-                    self.say(f'erro: sem navegador; abra {g}')
+                self.say(f'imagens copiadas em {g} (abra a pasta no VS Code)')
         elif k in (ord('l'), ord('L')):
             self.show_log = not self.show_log
+        elif k == ord('t'):
+            self.show_sys = not self.show_sys
+        elif k == ord('T'):
+            self.run_btop()
         return True
+
+    def run_btop(self):
+        """Pausa a TUI e abre o btop de verdade; o treino segue rodando em segundo plano. Sai do btop com q."""
+        if not shutil.which('btop'):
+            self.say('erro: btop não instalado — sudo apt install btop (a tecla t já mostra CPU/RAM/GPU/temperaturas)')
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            subprocess.run(['btop'])
+        finally:
+            curses.reset_prog_mode()
+            self.scr.clear()
+            self.scr.refresh()
 
     # ---------- desenho ----------
     def draw(self):
@@ -325,6 +356,8 @@ class UI:
             return self.log_view()
         if self.show_help:
             return self.help_view()
+        if self.show_sys:
+            return self.sys_view()
 
         # herói: dígitos grandes + veredito
         base = (start or {}).get('baseline') or 0.0
@@ -443,13 +476,110 @@ class UI:
         if files and not S['running']:
             self.put(h - 3, 1, ('Arquivos do run: ' + ' · '.join(f'{f["name"]} {f["size"] / 1e6:.1f}MB' if f['size'] > 1e6 else f'{f["name"]}' for f in files)
                                 + f'  em {S.get("run_dir", "")}')[: w - 3], DIM)
+        else:
+            self.sys_strip(h - 3)
         self.footer(ban, bp)
+
+    def sys_strip(self, y):
+        """Uma linha com os sensores principais (a tecla t abre o painel completo)."""
+        d = self.mon.snapshot()['data']
+        if not d:
+            return
+        g, x = d.get('gpu'), 1
+        segs = [('CPU ', DIM), (f'{d["cpu"]:.0f}%' if d.get('cpu') is not None else '--', INK)]
+        if d.get('cpu_temp') is not None:
+            segs += [(f' {d["cpu_temp"]:.0f}°C', temp_pair(d['cpu_temp']))]
+        if d.get('ram_total'):
+            segs += [('   RAM ', DIM), (f'{d["ram_used"]:.1f}/{d["ram_total"]:.0f}GB', INK)]
+        if g:
+            segs += [('   GPU ', DIM), (f'{g["util"]:.0f}%' if g['util'] is not None else '--', INK)]
+            if g['temp'] is not None:
+                segs += [(f' {g["temp"]:.0f}°C', temp_pair(g['temp']))]
+            if g['mem_total']:
+                segs += [('   VRAM ', DIM), (f'{g["mem_used"] / 1024:.1f}/{g["mem_total"] / 1024:.0f}GB', INK)]
+        segs += [('   (t = sensores)', DIM)]
+        for text, pair in segs:
+            self.put(y, x, text, pair)
+            x += len(text)
+
+    def sys_view(self):
+        """Painel de sensores estilo btop: barras + histórico de CPU, RAM, GPU, VRAM e temperaturas."""
+        h, w = self.scr.getmaxyx()
+        self.rule(1, 'sensores · estilo btop (t volta · T abre o btop de verdade)')
+        s = self.mon.snapshot()
+        d, hist = s['data'], s['hist']
+        if not d:
+            self.put(3, 2, 'lendo sensores…', DIM)
+            return self.footer('', DIM)
+        bw = max(10, min(w - 44, 48))
+        sx = 12 + bw + 16            # coluna do histórico
+        sw = w - sx - 2
+
+        def row(y, label, frac, text, pair, key=None, top=100.0):
+            self.put(y, 2, f'{label:<6}', INK, True)
+            n = int(max(0.0, min(1.0, frac)) * bw)
+            self.put(y, 9, '█' * n, pair)
+            self.put(y, 9 + n, '─' * (bw - n), DIM)
+            self.put(y, 10 + bw, text, INK)
+            if key and sw >= 10 and hist.get(key):
+                self.put(y, sx, spark_abs(hist[key], sw, top), pair)
+
+        y = 3
+        cpu = d.get('cpu')
+        row(y, 'CPU', (cpu or 0) / 100, f'{cpu:5.1f}%' if cpu is not None else '  n/d ', L2, 'cpu')
+        y += 1
+        ct = d.get('cpu_temp')
+        if ct is not None:
+            row(y, 'temp', ct / 100, f'{ct:5.1f}°C', temp_pair(ct), 'ctemp')
+        else:
+            self.put(y, 2, 'temp  ', INK, True)
+            self.put(y, 9, 'n/d — o WSL não expõe a temperatura da CPU (no Linux nativo aparece aqui)', DIM)
+        y += 1
+        if d.get('cores'):
+            self.put(y, 2, 'cores ', INK, True)
+            self.put(y, 9, ''.join(EIGHTHS[max(1, min(8, round(8 * c / 100)))] for c in d['cores'])[: w - 12], L2)
+            y += 1
+        y += 1
+        if d.get('ram_total'):
+            frac = d['ram_used'] / d['ram_total']
+            row(y, 'RAM', frac, f'{d["ram_used"]:4.1f}/{d["ram_total"]:.0f}GB', L1, 'ram')
+        y += 2
+        g = d.get('gpu')
+        if not g:
+            self.put(y, 2, 'GPU   ', INK, True)
+            self.put(y, 9, 'nvidia-smi não encontrado (sem GPU NVIDIA visível)', DIM)
+        else:
+            self.put(y, 2, g['name'], REWARD, True)
+            y += 1
+            u = g['util']
+            row(y, 'GPU', (u or 0) / 100, f'{u:5.1f}%' if u is not None else '  n/d ', REWARD, 'gpu')
+            y += 1
+            if g['mem_total']:
+                row(y, 'VRAM', g['mem_used'] / g['mem_total'], f'{g["mem_used"]:.0f}/{g["mem_total"]:.0f}MB', L3, 'vram')
+                y += 1
+            t = g['temp']
+            if t is not None:
+                row(y, 'temp', t / 100, f'{t:5.1f}°C', temp_pair(t), 'gtemp')
+                y += 1
+            extra = []
+            if g['power'] is not None:
+                extra.append(f'{g["power"]:.0f}' + (f'/{g["power_limit"]:.0f}' if g['power_limit'] else '') + ' W')
+            if g['clock'] is not None:
+                extra.append(f'{g["clock"]:.0f} MHz')
+            if extra:
+                self.put(y, 9, ' · '.join(extra), DIM)
+                y += 1
+        y += 1
+        legenda = 'temperatura: verde < 70°C · âmbar < 80°C · vermelho ≥ 80°C (GPU esquenta mais no treino com batch máx)'
+        if y < h - 3:
+            self.put(y, 2, legenda[: w - 4], DIM)
+        self.footer('', DIM)
 
     def footer(self, ban='', bp=DIM):
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 1, ban[: w - 3], bp)
         info = (f'? ajuda · s {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · b batch · r RAM · '
-                f'v VRAM · m modelo · i imagens · o relatório · l {"voltar" if self.show_log else "log"} · q sair')
+                f'v VRAM · m modelo · i imagens · o relatório · t sensores · T btop · l {"voltar" if self.show_log else "log"} · q sair')
         self.put(h - 1, 1, info, DIM)
 
     def help_view(self):

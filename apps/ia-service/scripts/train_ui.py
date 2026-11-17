@@ -72,19 +72,19 @@ def image_path(name: str, events=None):
 
 
 def write_gallery() -> 'Path | None':
-    """HTML simples com as imagens do run (links file://) — o TUI abre isto no navegador (tecla i)."""
-    import html as _h
-    imgs = list_images(read_events())
+    """Copia as imagens do run para runs/ui/imagens/ (abra a pasta no VS Code) — tecla i da TUI. Devolve a pasta."""
+    import shutil
+    ev = read_events()
+    imgs = list_images(ev)
     if not imgs:
         return None
-    d = run_dir(read_events())
-    files = ''.join(f'<li>{_h.escape(f["path"])} ({f["size"] / 1e6:.1f} MB)</li>' for f in list_files(read_events()))
-    figs = ''.join(f'<figure><img src="{(d / i["name"]).as_uri()}" style="max-width:100%"><figcaption>{_h.escape(i["caption"])}</figcaption></figure>' for i in imgs)
-    out = RUN_DIR / 'galeria.html'
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    out.write_text('<!doctype html><meta charset="utf-8"><title>Imagens do treino</title>'
-                   '<body style="background:#0d0c0a;color:#ece6d4;font:14px monospace;max-width:1100px;margin:auto;padding:16px">'
-                   f'<h2>Arquivos do run</h2><ul>{files}</ul><h2>Imagens do treino</h2>{figs}</body>', encoding='utf-8')
+    d = run_dir(ev)
+    out = RUN_DIR / 'imagens'
+    out.mkdir(parents=True, exist_ok=True)
+    for i in imgs:
+        src = d / i['name']
+        if src.exists():
+            shutil.copy2(src, out / Path(i['name']).name)
     return out
 
 
