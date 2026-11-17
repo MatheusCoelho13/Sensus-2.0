@@ -8,6 +8,7 @@ Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v 
         t sensores (CPU/RAM/GPU/temperaturas, estilo btop) · T abre o btop de verdade · q sair (para o treino)
 """
 import curses
+import os
 import shutil
 import subprocess
 import sys
@@ -49,6 +50,13 @@ RAM_CHOICES = [0, 2, 4, 8, 16, 32]       # GB p/ cache de imagens; 0 = máximo (
 VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]    # GB de GPU; 0 = máximo (a GPU inteira)
 
 INK, REWARD, PUNISH, DIM, L1, L2, L3 = range(1, 8)
+
+# Parada automática por temperatura da GPU (°C). 0 desliga. Ex: MAX_TEMP=80 make tui
+try:
+    MAX_TEMP = int(os.environ.get('MAX_TEMP', '85'))
+except ValueError:
+    MAX_TEMP = 85
+HOT_SAMPLES = 2   # leituras seguidas >= MAX_TEMP (a GPU é lida a cada 2s) — ignora picos de 1 amostra
 
 
 def rgb_to_xterm(r, g, b):
@@ -110,6 +118,7 @@ class UI:
         self.scr, self.msg, self.show_log = scr, '', False
         self.msg_until, self.show_help, self.show_sys = 0.0, False, False
         self.mon = sysmon.SysMon()
+        self.hot, self.hot_seen, self.thermal_stop = 0, None, False
         self.target, self.epochs, self.model = 0.60, 300, ''
         self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
         self.quitting = False
@@ -309,6 +318,26 @@ class UI:
             self.run_btop()
         return True
 
+    def check_thermal(self):
+        """Se a GPU ficar >= MAX_TEMP em leituras seguidas, pede a parada graciosa (termina a época e salva best.pt/last.pt)."""
+        if not MAX_TEMP or not self.S['running']:
+            self.hot, self.hot_seen, self.thermal_stop = 0, None, False
+            return
+        g = self.mon.snapshot()['data'].get('gpu')
+        t = g and g.get('temp')
+        if t is None or self.thermal_stop:
+            return
+        # só conta uma leitura nova da GPU: mudou o valor ou passaram 2s desde a última contagem
+        now = time.time()
+        if self.hot_seen is None or now - self.hot_seen >= 2.0:
+            self.hot_seen = now
+            self.hot = self.hot + 1 if t >= MAX_TEMP else 0
+        if self.hot >= HOT_SAMPLES:
+            self.thermal_stop = True
+            core.stop()
+            self.say(f'🔥 GPU em {t:.0f}°C (limite {MAX_TEMP}°C): parando o treino — termina a época e salva best.pt/last.pt. '
+                     f'Deixe esfriar e inicie de novo (s).', 3600)
+
     def run_btop(self):
         """Pausa a TUI e abre o btop de verdade; o treino segue rodando em segundo plano. Sai do btop com q."""
         if not shutil.which('btop'):
@@ -497,7 +526,7 @@ class UI:
                 segs += [(f' {g["temp"]:.0f}°C', temp_pair(g['temp']))]
             if g['mem_total']:
                 segs += [('   VRAM ', DIM), (f'{g["mem_used"] / 1024:.1f}/{g["mem_total"] / 1024:.0f}GB', INK)]
-        segs += [('   (t = sensores)', DIM)]
+        segs += [(f'   (t = sensores · para a {MAX_TEMP}°C)' if MAX_TEMP else '   (t = sensores)', DIM)]
         for text, pair in segs:
             self.put(y, x, text, pair)
             x += len(text)
@@ -615,6 +644,7 @@ class UI:
                     self.model = self.S['models'][0] if self.S['models'] else ''
                 if self.msg and time.time() > self.msg_until:
                     self.msg = ''
+            self.check_thermal()
             self.draw()
             self.scr.refresh()
             k = self.scr.getch()

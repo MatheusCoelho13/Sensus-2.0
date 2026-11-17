@@ -14,6 +14,9 @@ BATCH ?= 0
 RAM_GB ?= 0
 VRAM_GB ?= 0
 WORKERS ?= 0
+# TUI: se a GPU chegar a MAX_TEMP °C (2 leituras seguidas) o treino é parado com segurança (salva best.pt/last.pt). 0 = desliga.
+MAX_TEMP ?= 85
+export MAX_TEMP
 MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB) --workers $(WORKERS)
 PY = $(if $(wildcard .venv/bin/activate),. .venv/bin/activate && python3,python3)
 
@@ -33,6 +36,7 @@ help:
 	@echo "  make publicar    - sobe models/best.pt + relatório pro GitHub (commit só desses arquivos). Ex: make treinar publicar"
 	@echo "  make relatorio   - relatório com matriz de confusão por classe (WEIGHTS=models/best.pt); também sai no fim do treino"
 	@echo "  parada: EPOCHS=300 PATIENCE=100 TARGET=0.60  (para quando acabam as épocas, ou mAP50 >= TARGET, ou PATIENCE épocas sem melhorar)"
+	@echo "  segurança: a TUI para o treino se a GPU chegar a MAX_TEMP=85 °C (0 desliga). Ex: make tui MAX_TEMP=80"
 	@echo "  recursos (0 = máximo, padrão): BATCH= RAM_GB= VRAM_GB= WORKERS=   Ex: make treinar VRAM_GB=4 BATCH=8"
 
 instalar:
