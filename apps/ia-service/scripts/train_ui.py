@@ -113,7 +113,8 @@ def validate(body: dict) -> dict:
         raise ValueError('model deve ser um caminho relativo .pt (ex: models/yolov8n.pt)')
     return dict(target=num('target', float, 0.05, 0.99, 0.6), epochs=num('max_epochs', int, 1, 1000, 300),
                 imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 0, 128, 0), ram_gb=num('ram_gb', float, 0, 1024, 0), patience=num('patience', int, 1, 1000, DEFAULT_PATIENCE),
-                vram_gb=num('vram_gb', float, 0, 256, 0), model=model)
+                vram_gb=num('vram_gb', float, 0, 256, 0), model=model,
+                lr0=num('lr0', float, 0, 0.1, 0), freeze=num('freeze', int, -1, 100, -1))   # lr0 0 e freeze -1 = automático (train.py decide)
 
 
 def start(body: dict):
@@ -129,6 +130,10 @@ def start(body: dict):
                  '--batch', str(a['batch']), '--cls-weight', 'auto', '--max-epochs', str(a['epochs']),
                  '--patience', str(a['patience']), '--target-map', str(a['target']), '--events', str(EVENTS),
                  '--ram-gb', str(a['ram_gb']), '--vram-gb', str(a['vram_gb'])]
+        if a['lr0'] > 0:
+            train += ['--lr0', str(a['lr0'])]
+        if a['freeze'] >= 0:
+            train += ['--freeze', str(a['freeze'])]
         cmd = 'exec ' + shlex.join(train)   # exec: o pid do subprocesso passa a ser o do python
         if not DATASET.exists():  # baixa/balanceia o COCO antes se ainda não existe
             cmd = shlex.join([py, 'scripts/build_coco_dataset.py']) + ' && ' + cmd
@@ -138,7 +143,7 @@ def start(body: dict):
                                 start_new_session=True, env={**os.environ, 'PYTHONUNBUFFERED': '1'})
 
 
-DEFAULT_PATIENCE = 100  # épocas sem melhorar antes do treino parar sozinho
+DEFAULT_PATIENCE = 30  # épocas sem melhorar antes do treino parar sozinho
 STOP_GRACE = 180  # s p/ o treino salvar os pesos antes de ser morto à força
 
 

@@ -4,7 +4,7 @@
   make tui
 
 Mesmo motor do painel web (scripts/train_ui.py): sobe o train.py, lê runs/ui/events.jsonl.
-Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v VRAM · m modelo · o relatório · l log
+Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · z imgsz · p patience · a LR · f freeze · b batch · r RAM · v VRAM · m modelo · o relatório · l log
         t sensores (CPU/RAM/GPU/temperaturas, estilo btop) · T abre o btop de verdade · q sair (para o treino)
 """
 import curses
@@ -30,14 +30,20 @@ GLYPH = {
     '.': ['  ', '  ', '  ', '██', '██'],
 }
 EIGHTHS = ' ▁▂▃▄▅▆▇█'
-CONFIG_KEYS = {ord(c) for c in 'eEbBrRvVmM+=-_'}
+CONFIG_KEYS = {ord(c) for c in 'eEbBrRvVmMzZpPaAfF+=-_'}
 HELP = [
     ('ÉPOCAS (tecla e)', 'Quantas vezes a rede vê o conjunto de treino inteiro. Mais épocas = mais aprendizado e mais tempo. '
                          'É um LIMITE: o treino pode parar antes (veja "quando para").'),
-    ('QUANDO PARA', '1) acabaram as épocas · 2) o mAP50 chegou ao alvo · 3) passaram 100 épocas seguidas sem melhorar (patience) · '
+    ('QUANDO PARA', '1) acabaram as épocas · 2) o mAP50 chegou ao alvo · 3) passaram N épocas seguidas sem melhorar (patience) · '
                     '4) você apertou s ou q. Ao fim, o painel diz qual foi o motivo.'),
     ('ALVO mAP50 (+/-)', 'Nota de 0 a 1 de quão bem a rede acha os objetos. Chegou nela, o treino encerra. Se o modelo de partida '
                          '(best.pt) já passa do alvo, o alvo é ignorado e o treino segue até acabar as épocas.'),
+    ('IMGSZ (z)', 'Resolução das imagens no treino (px). Maior enxerga melhor objetos pequenos (book, bottle, cell phone), mas gasta '
+                  'muito mais VRAM e tempo: 640 padrão, 800, 960, 1280. Na GPU de 4GB, com 960+ use batch pequeno (4).'),
+    ('PATIENCE (p)', 'Quantas épocas seguidas sem melhorar antes de parar sozinho. Menor = para antes (economiza tempo).'),
+    ('LR (a)', 'Taxa de aprendizado inicial. "auto" = 0.002 ao partir de pesos pré-treinados (0.0005 se continua de best.pt). '
+               'Alta demais faz o modelo esquecer o que já sabia (o mAP chegou a cair de 0.50 p/ 0.13).'),
+    ('FREEZE (f)', 'Camadas iniciais congeladas (não treinam). "auto" = 10 ao partir de pesos pré-treinados. 0 treina tudo.'),
     ('BATCH (b)', 'Imagens processadas por vez. Maior = mais rápido, mas usa mais memória da GPU. "máx" ocupa 90% da VRAM.'),
     ('RAM (r) / VRAM (v)', 'RAM: quanto de memória pode guardar as imagens em cache. VRAM: quanto da placa de vídeo o treino pode usar. '
                            '"máx" = sem limite.'),
@@ -46,6 +52,9 @@ HELP = [
                                  'contra os rótulos: é aprendizado supervisionado.'),
     ('IMPORTANTE', 'Mudar a configuração não afeta um treino em andamento: pare (s) e inicie de novo.'),
 ]
+IMGSZ_CHOICES = [640, 800, 960, 1280]
+LR_CHOICES = [0, 0.0005, 0.001, 0.002, 0.005, 0.01]   # 0 = auto
+FREEZE_CHOICES = [-1, 0, 10, 15, 20]                   # -1 = auto
 BATCH_CHOICES = [0, 4, 8, 16, 32, 64]   # 0 = máximo (ocupa a GPU)
 RAM_CHOICES = [0, 2, 4, 8, 16, 32]       # GB p/ cache de imagens; 0 = máximo (toda a RAM livre)
 VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]    # GB de GPU; 0 = máximo (a GPU inteira)
@@ -127,6 +136,7 @@ class UI:
         self.ask, self.busy, self.was_running, self.msg_pair = None, None, False, PUNISH   # ask: 'report' | 'publish' | None
         self.target, self.epochs, self.model = 0.60, 300, ''
         self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
+        self.imgsz_i, self.lr_i, self.freeze_i, self.patience = 0, 0, 0, core.DEFAULT_PATIENCE
         self.quitting = False
         self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [], 'report_ready': False, 'files': [],
                                               'exit_code': None}, 0.0, {}
@@ -250,7 +260,7 @@ class UI:
             if not w.exists():
                 w = core.run_dir(self.S['events']) / 'weights' / 'best.pt'
             self.run_post('relatório', [sys.executable, 'scripts/report.py', '--weights', str(w),
-                                        '--data', 'config/data.yaml', '--imgsz', '640'], next_ask='publish')
+                                        '--data', 'config/data.yaml', '--imgsz', str(IMGSZ_CHOICES[self.imgsz_i])], next_ask='publish')
         elif stage == 'publish':
             if yes:
                 self.run_post('publicação no GitHub', [sys.executable, 'scripts/publish.py'])
@@ -314,7 +324,8 @@ class UI:
             else:
                 core.start({'target': self.target, 'max_epochs': self.epochs, 'model': self.model,
                             'batch': BATCH_CHOICES[self.batch_i], 'ram_gb': RAM_CHOICES[self.ram_i],
-                            'vram_gb': VRAM_CHOICES[self.vram_i]})
+                            'vram_gb': VRAM_CHOICES[self.vram_i], 'imgsz': IMGSZ_CHOICES[self.imgsz_i],
+                            'patience': self.patience, 'lr0': LR_CHOICES[self.lr_i], 'freeze': FREEZE_CHOICES[self.freeze_i]})
                 self.msg = ''
         except ValueError as e:
             self.say(f'erro: {e}')
@@ -355,6 +366,14 @@ class UI:
             ms = self.S['models']
             if ms:
                 self.model = ms[(ms.index(self.model) + 1) % len(ms)] if self.model in ms else ms[0]
+        elif k in (ord('z'), ord('Z')):
+            self.imgsz_i = (self.imgsz_i + 1) % len(IMGSZ_CHOICES)
+        elif k in (ord('p'), ord('P')):
+            self.patience = self.ask_number('patience', self.patience, 1, 1000)
+        elif k in (ord('a'), ord('A')):
+            self.lr_i = (self.lr_i + 1) % len(LR_CHOICES)
+        elif k in (ord('f'), ord('F')):
+            self.freeze_i = (self.freeze_i + 1) % len(FREEZE_CHOICES)
         elif k in (ord('b'), ord('B')):
             self.batch_i = (self.batch_i + 1) % len(BATCH_CHOICES)
         elif k in (ord('r'), ord('R')):
@@ -483,17 +502,19 @@ class UI:
                f'RAM {f"{ram}GB" if ram else "máx"} · VRAM {f"{vram}GB" if vram else "máx"} · '
                f'modelo {(self.model.split("/")[-1][:-3] or "—") if self.model else "—"}')
         self.put(7, 2, cfg, DIM)
+        lr, fr = LR_CHOICES[self.lr_i], FREEZE_CHOICES[self.freeze_i]
+        self.put(8, 2, f'imgsz {IMGSZ_CHOICES[self.imgsz_i]} · patience {self.patience} · LR {lr if lr else "auto"} · freeze {fr if fr >= 0 else "auto"}', DIM)
 
         # régua até o alvo
         bw = min(w - 6, 70)
         filled = int(m * bw)
         tpos = int(target * bw)
-        self.put(8, 2, '█' * filled + '─' * (bw - filled), INK if last else DIM)
-        self.put(8, 2 + tpos, '┃', REWARD, True)
-        self.put(9, 2, '0', DIM)
-        self.put(9, 2 + bw - 1, '1', DIM)
-        self.put(9, max(2, 2 + tpos - 3), f'ALVO {target:.2f}', REWARD)
-        y = 10
+        self.put(9, 2, '█' * filled + '─' * (bw - filled), INK if last else DIM)
+        self.put(9, 2 + tpos, '┃', REWARD, True)
+        self.put(10, 2, '0', DIM)
+        self.put(10, 2 + bw - 1, '1', DIM)
+        self.put(10, max(2, 2 + tpos - 3), f'ALVO {target:.2f}', REWARD)
+        y = 11
 
         # gráfico de barras: mAP50 (verde=recompensa, vermelho=punição) + sparklines de loss
         rows = max(4, min(8, h - y - 17))
@@ -564,7 +585,7 @@ class UI:
             ban = 'Dataset COCO não encontrado: será baixado e balanceado antes do treino.'
         elif not S['running'] and not last:
             ban = (f'Para quando: acabarem {self.epochs} épocas · ou mAP50 ≥ {self.target:.2f} · '
-                   f'ou {core.DEFAULT_PATIENCE} épocas sem melhorar  (? explica tudo)')
+                   f'ou {self.patience} épocas sem melhorar  (? explica tudo)')
         if S.get('report_ready') and not S['running'] and not ban:
             ban = 'Relatório com matriz de confusão pronto: tecla o abre no navegador (runs/report/latest.html)'
         if self.msg and time.time() < self.msg_until:
@@ -680,7 +701,7 @@ class UI:
     def footer(self, ban='', bp=DIM):
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 1, ban[: w - 3], bp)
-        info = (f'? ajuda · s {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · b batch · r RAM · '
+        info = (f'? ajuda · s {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · z imgsz · p patience · a LR · f freeze · b batch · r RAM · '
                 f'v VRAM · m modelo · i imagens · o relatório · t sensores · T btop · l {"voltar" if self.show_log else "log"} · q sair')
         self.put(h - 1, 1, info, DIM)
 
