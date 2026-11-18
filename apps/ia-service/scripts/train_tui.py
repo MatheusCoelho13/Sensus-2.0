@@ -4,15 +4,21 @@
   make tui
 
 Mesmo motor do painel web (scripts/train_ui.py): sobe o train.py, lê runs/ui/events.jsonl.
-Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · b batch · r RAM · v VRAM · m modelo · o relatório · l log · q sair (para o treino)
+Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · z imgsz · p patience · a LR · f freeze · b batch · r RAM · v VRAM · u AMP · c cache · w workers · m modelo · o relatório · l log
+        t sensores (CPU/RAM/GPU/temperaturas, estilo btop) · T abre o btop de verdade · q sair (para o treino)
 """
 import curses
+import os
+import shutil
+import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sysmon  # noqa: E402
 import train_ui as core  # noqa: E402
 
 GLYPH = {
@@ -24,27 +30,53 @@ GLYPH = {
     '.': ['  ', '  ', '  ', '██', '██'],
 }
 EIGHTHS = ' ▁▂▃▄▅▆▇█'
-CONFIG_KEYS = {ord(c) for c in 'eEbBrRvVmM+=-_'}
+CONFIG_KEYS = {ord(c) for c in 'eEbBrRvVmMzZpPaAfFuUcCwW+=-_'}
 HELP = [
     ('ÉPOCAS (tecla e)', 'Quantas vezes a rede vê o conjunto de treino inteiro. Mais épocas = mais aprendizado e mais tempo. '
                          'É um LIMITE: o treino pode parar antes (veja "quando para").'),
-    ('QUANDO PARA', '1) acabaram as épocas · 2) o mAP50 chegou ao alvo · 3) passaram 100 épocas seguidas sem melhorar (patience) · '
+    ('QUANDO PARA', '1) acabaram as épocas · 2) o mAP50 chegou ao alvo · 3) passaram N épocas seguidas sem melhorar (patience) · '
                     '4) você apertou s ou q. Ao fim, o painel diz qual foi o motivo.'),
     ('ALVO mAP50 (+/-)', 'Nota de 0 a 1 de quão bem a rede acha os objetos. Chegou nela, o treino encerra. Se o modelo de partida '
                          '(best.pt) já passa do alvo, o alvo é ignorado e o treino segue até acabar as épocas.'),
+    ('IMGSZ (z)', 'Resolução das imagens no treino (px). Maior enxerga melhor objetos pequenos (book, bottle, cell phone), mas gasta '
+                  'muito mais VRAM e tempo: 640 padrão, 800, 960, 1280. Na GPU de 4GB, com 960+ use batch pequeno (4).'),
+    ('PATIENCE (p)', 'Quantas épocas seguidas sem melhorar antes de parar sozinho. Menor = para antes (economiza tempo).'),
+    ('LR (a)', 'Taxa de aprendizado inicial. "auto" = 0.002 ao partir de pesos pré-treinados (0.0005 se continua de best.pt). '
+               'Alta demais faz o modelo esquecer o que já sabia (o mAP chegou a cair de 0.50 p/ 0.13).'),
+    ('FREEZE (f)', 'Camadas iniciais congeladas (não treinam). "auto" = 10 ao partir de pesos pré-treinados. 0 treina tudo.'),
     ('BATCH (b)', 'Imagens processadas por vez. Maior = mais rápido, mas usa mais memória da GPU. "máx" ocupa 90% da VRAM.'),
     ('RAM (r) / VRAM (v)', 'RAM: quanto de memória pode guardar as imagens em cache. VRAM: quanto da placa de vídeo o treino pode usar. '
                            '"máx" = sem limite.'),
+    ('AMP (u)', 'Precisão mista (fp16): mais rápido e usa menos VRAM. Em algumas GTX 16xx dá loss nan — se acontecer, desligue (off).'),
+    ('CACHE (c)', 'ram = imagens decodificadas na memória (mais rápido; só liga se couber no limite de RAM) · disk = em disco · off = sem cache.'),
+    ('WORKERS (w)', 'Processos que carregam e aumentam as imagens enquanto a GPU treina. "máx" = todas as threads da CPU. Se a GPU ficar ociosa, aumente.'),
     ('MODELO (m)', 'Ponto de partida. best.pt = continua do melhor treino já feito e tenta melhorar (taxa de aprendizado baixa).'),
     ('▲ RECOMPENSA / ▼ PUNIÇÃO', 'O mAP50 subiu / caiu em relação à época anterior. A rede corrige os pesos a partir do erro (loss) '
                                  'contra os rótulos: é aprendizado supervisionado.'),
     ('IMPORTANTE', 'Mudar a configuração não afeta um treino em andamento: pare (s) e inicie de novo.'),
 ]
+IMGSZ_CHOICES = [640, 800, 960, 1280]
+LR_CHOICES = [0, 0.0005, 0.001, 0.002, 0.005, 0.01]   # 0 = auto
+FREEZE_CHOICES = [-1, 0, 10, 15, 20]                   # -1 = auto
 BATCH_CHOICES = [0, 4, 8, 16, 32, 64]   # 0 = máximo (ocupa a GPU)
 RAM_CHOICES = [0, 2, 4, 8, 16, 32]       # GB p/ cache de imagens; 0 = máximo (toda a RAM livre)
 VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]    # GB de GPU; 0 = máximo (a GPU inteira)
+AMP_CHOICES = ['on', 'off']
+CACHE_CHOICES = ['ram', 'disk', 'false']
+WORKERS_CHOICES = [0, 2, 4, 6, 8, 12]    # 0 = máximo (todas as threads da CPU)
 
 INK, REWARD, PUNISH, DIM, L1, L2, L3 = range(1, 8)
+
+# Parada automática por temperatura da GPU (°C). 0 desliga. Ex: MAX_TEMP=80 make tui
+try:
+    MAX_TEMP = int(os.environ.get('MAX_TEMP', '85'))
+except ValueError:
+    MAX_TEMP = 85
+try:
+    MAX_CPU_TEMP = int(os.environ.get('MAX_CPU_TEMP', '95'))   # só vale se a CPU tiver sensor (Linux nativo ou LibreHardwareMonitor)
+except ValueError:
+    MAX_CPU_TEMP = 95
+HOT_SAMPLES = 2  # leituras seguidas >= MAX_TEMP (a GPU é lida a cada 2s) — ignora picos de 1 amostra
 
 
 def rgb_to_xterm(r, g, b):
@@ -91,12 +123,27 @@ def spark(values: list, width: int) -> str:
     return ''.join(EIGHTHS[max(1, min(8, round(8 * v / mx)))] for v in vs)
 
 
+def spark_abs(values: list, width: int, top: float = 100.0) -> str:
+    """Sparkline numa escala fixa 0..top (percentuais/temperaturas não podem ser relativos ao máximo)."""
+    return ''.join(EIGHTHS[max(1, min(8, round(8 * v / top)))] for v in values[-width:])
+
+
+def temp_pair(t):
+    """Cor da temperatura: verde < 70°C, âmbar < 80°C, vermelho acima."""
+    return DIM if t is None else REWARD if t < 70 else L1 if t < 80 else PUNISH
+
+
 class UI:
     def __init__(self, scr):
         self.scr, self.msg, self.show_log = scr, '', False
-        self.msg_until, self.show_help = 0.0, False
+        self.msg_until, self.show_help, self.show_sys = 0.0, False, False
+        self.mon = sysmon.SysMon()
+        self.hot, self.hot_seen, self.thermal_stop = 0, None, False
+        self.ask, self.busy, self.was_running, self.msg_pair = None, None, False, PUNISH   # ask: 'report' | 'publish' | None
         self.target, self.epochs, self.model = 0.60, 300, ''
         self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
+        self.amp_i, self.cache_i, self.workers_i = 0, 0, 0
+        self.imgsz_i, self.lr_i, self.freeze_i, self.patience = 0, 0, 0, core.DEFAULT_PATIENCE
         self.quitting = False
         self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [], 'report_ready': False, 'files': [],
                                               'exit_code': None}, 0.0, {}
@@ -195,8 +242,57 @@ class UI:
             self.put(y, 2, f' {label} ', DIM)
 
     # ---------- ações ----------
-    def say(self, text, secs=6):
-        self.msg, self.msg_until = text, time.time() + secs
+    def say(self, text, secs=6, pair=PUNISH):
+        self.msg, self.msg_until, self.msg_pair = text, time.time() + secs, pair
+
+    # ---------- pós-treino: relatório + publicar no GitHub (sempre perguntando) ----------
+    PROMPTS = {'report': 'Treino acabou. Gerar o relatório com matriz de confusão por classe?  [s] sim  [n] não',
+               'publish': 'Commitar e subir esta run no GitHub (só models/best.pt + o relatório, nada além)?  [s] sim  [n] não'}
+
+    def after_training(self):
+        """Chamado quando o treino acaba: pergunta o que fazer. O train.py já gera o relatório se terminou por conta própria."""
+        has_weights = any(f['name'] == 'weights/best.pt' for f in self.S.get('files') or [])
+        if self.quitting or not has_weights:
+            return
+        made_report = any(e['type'] == 'report' for e in self.S['events'])
+        self.ask = 'publish' if made_report else 'report'
+
+    def answer(self, yes):
+        stage, self.ask = self.ask, None
+        if stage == 'report':
+            if not yes:
+                self.ask = 'publish'
+                return
+            w = core.ROOT / 'models' / 'best.pt'
+            if not w.exists():
+                w = core.run_dir(self.S['events']) / 'weights' / 'best.pt'
+            self.run_post('relatório', [sys.executable, 'scripts/report.py', '--weights', str(w),
+                                        '--data', 'config/data.yaml', '--imgsz', str(IMGSZ_CHOICES[self.imgsz_i])], next_ask='publish')
+        elif stage == 'publish':
+            if yes:
+                self.run_post('publicação no GitHub', [sys.executable, 'scripts/publish.py'])
+            else:
+                self.say('ok: nada foi enviado. Quando quiser: make publicar', 10, DIM)
+
+    def run_post(self, label, cmd, next_ask=None):
+        """Roda o comando numa thread (a TUI não trava) e avisa o resultado."""
+        self.busy = f'{label}: rodando… (pode levar alguns minutos; o treino já acabou)'
+
+        def work():
+            try:
+                r = subprocess.run(cmd, cwd=core.ROOT, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                   env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+                lines = [ln for ln in (r.stdout + '\n' + r.stderr).strip().splitlines() if ln.strip()]
+                ok, tail = r.returncode == 0, (lines[-1] if lines else '')
+            except OSError as e:
+                ok, tail = False, str(e)
+            self.busy = None
+            if ok:
+                self.say(f'{label}: pronto. {tail}', 3600, REWARD)
+                self.ask = next_ask
+            else:
+                self.say(f'erro em {label}: {tail} (veja: make {"relatorio" if "relat" in label else "publicar"})', 3600)
+        threading.Thread(target=work, daemon=True).start()
 
     def ask_number(self, label, current, lo, hi):
         """Digite o número na linha de baixo e Enter (Esc cancela)."""
@@ -235,12 +331,24 @@ class UI:
             else:
                 core.start({'target': self.target, 'max_epochs': self.epochs, 'model': self.model,
                             'batch': BATCH_CHOICES[self.batch_i], 'ram_gb': RAM_CHOICES[self.ram_i],
-                            'vram_gb': VRAM_CHOICES[self.vram_i]})
+                            'vram_gb': VRAM_CHOICES[self.vram_i], 'imgsz': IMGSZ_CHOICES[self.imgsz_i],
+                            'patience': self.patience, 'lr0': LR_CHOICES[self.lr_i], 'freeze': FREEZE_CHOICES[self.freeze_i],
+                            'amp': AMP_CHOICES[self.amp_i], 'cache': CACHE_CHOICES[self.cache_i],
+                            'workers': WORKERS_CHOICES[self.workers_i]})
                 self.msg = ''
         except ValueError as e:
             self.say(f'erro: {e}')
 
     def key(self, k):
+        if self.ask and k not in (ord('q'), ord('Q')):   # pergunta pós-treino: só s/n (Esc = não)
+            if k in (ord('s'), ord('S'), ord('y'), ord('Y')):
+                self.answer(True)
+            elif k in (ord('n'), ord('N'), 27):
+                self.answer(False)
+            return True
+        if self.busy and k in (ord('s'), ord('S')):
+            self.say('aguarde: ainda executando o passo anterior…')
+            return True
         if k == ord('?'):
             self.show_help = not self.show_help
             return True
@@ -267,12 +375,26 @@ class UI:
             ms = self.S['models']
             if ms:
                 self.model = ms[(ms.index(self.model) + 1) % len(ms)] if self.model in ms else ms[0]
+        elif k in (ord('z'), ord('Z')):
+            self.imgsz_i = (self.imgsz_i + 1) % len(IMGSZ_CHOICES)
+        elif k in (ord('p'), ord('P')):
+            self.patience = self.ask_number('patience', self.patience, 1, 1000)
+        elif k in (ord('a'), ord('A')):
+            self.lr_i = (self.lr_i + 1) % len(LR_CHOICES)
+        elif k in (ord('f'), ord('F')):
+            self.freeze_i = (self.freeze_i + 1) % len(FREEZE_CHOICES)
         elif k in (ord('b'), ord('B')):
             self.batch_i = (self.batch_i + 1) % len(BATCH_CHOICES)
         elif k in (ord('r'), ord('R')):
             self.ram_i = (self.ram_i + 1) % len(RAM_CHOICES)
         elif k in (ord('v'), ord('V')):
             self.vram_i = (self.vram_i + 1) % len(VRAM_CHOICES)
+        elif k in (ord('u'), ord('U')):
+            self.amp_i = (self.amp_i + 1) % len(AMP_CHOICES)
+        elif k in (ord('c'), ord('C')):
+            self.cache_i = (self.cache_i + 1) % len(CACHE_CHOICES)
+        elif k in (ord('w'), ord('W')):
+            self.workers_i = (self.workers_i + 1) % len(WORKERS_CHOICES)
         elif k in (ord('o'), ord('O')):
             if core.REPORT.exists():
                 import webbrowser
@@ -285,12 +407,55 @@ class UI:
             if not g:
                 self.say('erro: ainda não há imagens (elas surgem na 1ª época do treino)')
             else:
-                import webbrowser
-                if not webbrowser.open(g.as_uri()):
-                    self.say(f'erro: sem navegador; abra {g}')
+                self.say(f'imagens copiadas em {g} (abra a pasta no VS Code)')
         elif k in (ord('l'), ord('L')):
             self.show_log = not self.show_log
+        elif k == ord('t'):
+            self.show_sys = not self.show_sys
+        elif k == ord('T'):
+            self.run_btop()
         return True
+
+    def check_thermal(self):
+        """Se a GPU ficar >= MAX_TEMP em leituras seguidas, pede a parada graciosa (termina a época e salva best.pt/last.pt)."""
+        if not MAX_TEMP or not self.S['running']:
+            self.hot, self.hot_seen, self.thermal_stop = 0, None, False
+            return
+        d = self.mon.snapshot()['data']
+        g = d.get('gpu')
+        gt, ct = g and g.get('temp'), d.get('cpu_temp')
+        if (gt is None and ct is None) or self.thermal_stop:
+            return
+        # a cada 2s: conta uma leitura quente se GPU >= MAX_TEMP ou CPU >= MAX_CPU_TEMP
+        now = time.time()
+        if self.hot_seen is None or now - self.hot_seen >= 2.0:
+            self.hot_seen = now
+            hot_g = gt is not None and gt >= MAX_TEMP
+            hot_c = bool(MAX_CPU_TEMP) and ct is not None and ct >= MAX_CPU_TEMP
+            self.hot = self.hot + 1 if (hot_g or hot_c) else 0
+            if hot_g:
+                self.hot_what = f'GPU em {gt:.0f}°C (limite {MAX_TEMP}°C)'
+            elif hot_c:
+                self.hot_what = f'CPU em {ct:.0f}°C (limite {MAX_CPU_TEMP}°C)'
+        if self.hot >= HOT_SAMPLES:
+            self.thermal_stop = True
+            core.stop()
+            self.say(f'🔥 {self.hot_what}: parando o treino — termina a época e salva best.pt/last.pt. '
+                     f'Deixe esfriar e inicie de novo (s).', 3600)
+
+    def run_btop(self):
+        """Pausa a TUI e abre o btop de verdade; o treino segue rodando em segundo plano. Sai do btop com q."""
+        if not shutil.which('btop'):
+            self.say('erro: btop não instalado — sudo apt install btop (a tecla t já mostra CPU/RAM/GPU/temperaturas)')
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            subprocess.run(['btop'])
+        finally:
+            curses.reset_prog_mode()
+            self.scr.clear()
+            self.scr.refresh()
 
     # ---------- desenho ----------
     def draw(self):
@@ -325,6 +490,8 @@ class UI:
             return self.log_view()
         if self.show_help:
             return self.help_view()
+        if self.show_sys:
+            return self.sys_view()
 
         # herói: dígitos grandes + veredito
         base = (start or {}).get('baseline') or 0.0
@@ -353,17 +520,21 @@ class UI:
                f'RAM {f"{ram}GB" if ram else "máx"} · VRAM {f"{vram}GB" if vram else "máx"} · '
                f'modelo {(self.model.split("/")[-1][:-3] or "—") if self.model else "—"}')
         self.put(7, 2, cfg, DIM)
+        lr, fr = LR_CHOICES[self.lr_i], FREEZE_CHOICES[self.freeze_i]
+        self.put(8, 2, f'imgsz {IMGSZ_CHOICES[self.imgsz_i]} · patience {self.patience} · LR {lr if lr else "auto"} · freeze {fr if fr >= 0 else "auto"}', DIM)
+        wk = WORKERS_CHOICES[self.workers_i]
+        self.put(9, 2, f'AMP {AMP_CHOICES[self.amp_i]} · cache {CACHE_CHOICES[self.cache_i].replace("false", "off")} · workers {wk or "máx"}', DIM)
 
         # régua até o alvo
         bw = min(w - 6, 70)
         filled = int(m * bw)
         tpos = int(target * bw)
-        self.put(8, 2, '█' * filled + '─' * (bw - filled), INK if last else DIM)
-        self.put(8, 2 + tpos, '┃', REWARD, True)
-        self.put(9, 2, '0', DIM)
-        self.put(9, 2 + bw - 1, '1', DIM)
-        self.put(9, max(2, 2 + tpos - 3), f'ALVO {target:.2f}', REWARD)
-        y = 10
+        self.put(10, 2, '█' * filled + '─' * (bw - filled), INK if last else DIM)
+        self.put(10, 2 + tpos, '┃', REWARD, True)
+        self.put(11, 2, '0', DIM)
+        self.put(11, 2 + bw - 1, '1', DIM)
+        self.put(11, max(2, 2 + tpos - 3), f'ALVO {target:.2f}', REWARD)
+        y = 12
 
         # gráfico de barras: mAP50 (verde=recompensa, vermelho=punição) + sparklines de loss
         rows = max(4, min(8, h - y - 17))
@@ -434,22 +605,124 @@ class UI:
             ban = 'Dataset COCO não encontrado: será baixado e balanceado antes do treino.'
         elif not S['running'] and not last:
             ban = (f'Para quando: acabarem {self.epochs} épocas · ou mAP50 ≥ {self.target:.2f} · '
-                   f'ou {core.DEFAULT_PATIENCE} épocas sem melhorar  (? explica tudo)')
+                   f'ou {self.patience} épocas sem melhorar  (? explica tudo)')
         if S.get('report_ready') and not S['running'] and not ban:
             ban = 'Relatório com matriz de confusão pronto: tecla o abre no navegador (runs/report/latest.html)'
         if self.msg and time.time() < self.msg_until:
-            ban, bp = self.msg, PUNISH
+            ban, bp = self.msg, self.msg_pair
+        if self.busy:
+            ban, bp = self.busy, L1
+        elif self.ask:
+            ban, bp = self.PROMPTS[self.ask], REWARD
         files = S.get('files') or []
         if files and not S['running']:
             self.put(h - 3, 1, ('Arquivos do run: ' + ' · '.join(f'{f["name"]} {f["size"] / 1e6:.1f}MB' if f['size'] > 1e6 else f'{f["name"]}' for f in files)
                                 + f'  em {S.get("run_dir", "")}')[: w - 3], DIM)
+        else:
+            self.sys_strip(h - 3)
         self.footer(ban, bp)
+
+    def sys_strip(self, y):
+        """Uma linha com os sensores principais (a tecla t abre o painel completo)."""
+        d = self.mon.snapshot()['data']
+        if not d:
+            return
+        g, x = d.get('gpu'), 1
+        segs = [('CPU ', DIM), (f'{d["cpu"]:.0f}%' if d.get('cpu') is not None else '--', INK)]
+        if d.get('cpu_temp') is not None:
+            segs += [(f' {d["cpu_temp"]:.0f}°C', temp_pair(d['cpu_temp']))]
+        if d.get('ram_total'):
+            segs += [('   RAM ', DIM), (f'{d["ram_used"]:.1f}/{d["ram_total"]:.0f}GB', INK)]
+        if g:
+            segs += [('   GPU ', DIM), (f'{g["util"]:.0f}%' if g['util'] is not None else '--', INK)]
+            if g['temp'] is not None:
+                segs += [(f' {g["temp"]:.0f}°C', temp_pair(g['temp']))]
+            if g['mem_total']:
+                segs += [('   VRAM ', DIM), (f'{g["mem_used"] / 1024:.1f}/{g["mem_total"] / 1024:.0f}GB', INK)]
+        segs += [(f'   (t = sensores · para a {MAX_TEMP}°C)' if MAX_TEMP else '   (t = sensores)', DIM)]
+        for text, pair in segs:
+            self.put(y, x, text, pair)
+            x += len(text)
+
+    def sys_view(self):
+        """Painel de sensores estilo btop: barras + histórico de CPU, RAM, GPU, VRAM e temperaturas."""
+        h, w = self.scr.getmaxyx()
+        self.rule(1, 'sensores · estilo btop (t volta · T abre o btop de verdade)')
+        s = self.mon.snapshot()
+        d, hist = s['data'], s['hist']
+        if not d:
+            self.put(3, 2, 'lendo sensores…', DIM)
+            return self.footer('', DIM)
+        bw = max(10, min(w - 44, 48))
+        sx = 12 + bw + 16            # coluna do histórico
+        sw = w - sx - 2
+
+        def row(y, label, frac, text, pair, key=None, top=100.0):
+            self.put(y, 2, f'{label:<6}', INK, True)
+            n = int(max(0.0, min(1.0, frac)) * bw)
+            self.put(y, 9, '█' * n, pair)
+            self.put(y, 9 + n, '─' * (bw - n), DIM)
+            self.put(y, 10 + bw, text, INK)
+            if key and sw >= 10 and hist.get(key):
+                self.put(y, sx, spark_abs(hist[key], sw, top), pair)
+
+        y = 3
+        cpu = d.get('cpu')
+        row(y, 'CPU', (cpu or 0) / 100, f'{cpu:5.1f}%' if cpu is not None else '  n/d ', L2, 'cpu')
+        y += 1
+        ct = d.get('cpu_temp')
+        if ct is not None:
+            src = d.get('cpu_temp_src')
+            row(y, 'temp', ct / 100, f'{ct:5.1f}°C' + (f' · via {src}' if src and src != 'linux' else ''), temp_pair(ct), 'ctemp')
+        else:
+            self.put(y, 2, 'temp  ', INK, True)
+            self.put(y, 9, 'n/d — no Windows abra o LibreHardwareMonitor (admin) > Options > Remote Web Server'[: w - 11], DIM)
+        y += 1
+        if d.get('cores'):
+            self.put(y, 2, 'cores ', INK, True)
+            self.put(y, 9, ''.join(EIGHTHS[max(1, min(8, round(8 * c / 100)))] for c in d['cores'])[: w - 12], L2)
+            y += 1
+        y += 1
+        if d.get('ram_total'):
+            frac = d['ram_used'] / d['ram_total']
+            row(y, 'RAM', frac, f'{d["ram_used"]:4.1f}/{d["ram_total"]:.0f}GB', L1, 'ram')
+        y += 2
+        g = d.get('gpu')
+        if not g:
+            self.put(y, 2, 'GPU   ', INK, True)
+            self.put(y, 9, 'nvidia-smi não encontrado (sem GPU NVIDIA visível)', DIM)
+        else:
+            self.put(y, 2, g['name'], REWARD, True)
+            y += 1
+            u = g['util']
+            row(y, 'GPU', (u or 0) / 100, f'{u:5.1f}%' if u is not None else '  n/d ', REWARD, 'gpu')
+            y += 1
+            if g['mem_total']:
+                row(y, 'VRAM', g['mem_used'] / g['mem_total'], f'{g["mem_used"]:.0f}/{g["mem_total"]:.0f}MB', L3, 'vram')
+                y += 1
+            t = g['temp']
+            if t is not None:
+                row(y, 'temp', t / 100, f'{t:5.1f}°C', temp_pair(t), 'gtemp')
+                y += 1
+            extra = []
+            if g['power'] is not None:
+                extra.append(f'{g["power"]:.0f}' + (f'/{g["power_limit"]:.0f}' if g['power_limit'] else '') + ' W')
+            if g['clock'] is not None:
+                extra.append(f'{g["clock"]:.0f} MHz')
+            if extra:
+                self.put(y, 9, ' · '.join(extra), DIM)
+                y += 1
+        y += 1
+        legenda = 'temperatura: verde < 70°C · âmbar < 80°C · vermelho ≥ 80°C (GPU esquenta mais no treino com batch máx)'
+        if y < h - 3:
+            self.put(y, 2, legenda[: w - 4], DIM)
+        self.footer('', DIM)
 
     def footer(self, ban='', bp=DIM):
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 1, ban[: w - 3], bp)
-        info = (f'? ajuda · s {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · b batch · r RAM · '
-                f'v VRAM · m modelo · i imagens · o relatório · l {"voltar" if self.show_log else "log"} · q sair')
+        info = (f'? ajuda · s {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · z imgsz · p patience · a LR · f freeze · b batch · r RAM · '
+                f'v VRAM · u AMP · c cache · w workers · m modelo · i imagens · o relatório · t sensores · T btop · l {"voltar" if self.show_log else "log"} · q sair')
         self.put(h - 1, 1, info, DIM)
 
     def help_view(self):
@@ -481,10 +754,14 @@ class UI:
                 self.S, self.last_poll = core.state(), now
                 if self.quitting and not self.S['running']:
                     return
+                if self.was_running and not self.S['running']:
+                    self.after_training()
+                self.was_running = self.S['running']
                 if self.model not in self.S['models']:
                     self.model = self.S['models'][0] if self.S['models'] else ''
                 if self.msg and time.time() > self.msg_until:
                     self.msg = ''
+            self.check_thermal()
             self.draw()
             self.scr.refresh()
             k = self.scr.getch()

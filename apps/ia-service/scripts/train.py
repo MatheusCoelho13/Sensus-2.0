@@ -76,9 +76,10 @@ def parse_args():
     p.add_argument('--require-cuda', action='store_true')
     p.add_argument('--cls-weight', default='', help="'auto' ou lista 'w0,w1,...' (peso de erro por classe)")
     p.add_argument('--patience', type=int, default=30, help='épocas sem melhora antes de parar')
-    p.add_argument('--freeze', type=int, default=0, help='congela N primeiras camadas (use 10 com dataset pequeno)')
+    p.add_argument('--freeze', type=int, default=None, help='congela N primeiras camadas (padrão: 10 ao partir de pesos pré-treinados, 0 caso contrário)')
     p.add_argument('--lr0', type=float, default=None, help='learning rate inicial (default: automático)')
     p.add_argument('--cache', default='ram', choices=['ram', 'disk', 'false'], help='cache das imagens (ram = mais rápido)')
+    p.add_argument('--amp', default='on', choices=['on', 'off'], help='precisão mista (mais rápido). Em algumas GTX 16xx dá loss nan: use off')
     p.add_argument('--workers', type=int, default=0, help='processos de data loading (0 = máximo: todos os núcleos da CPU)')
     p.add_argument('--ram-gb', type=float, default=0, help='limite de RAM p/ o cache de imagens em GB (0 = máximo: toda a RAM livre)')
     p.add_argument('--vram-gb', type=float, default=0, help='limite de VRAM do processo em GB (0 = máximo: a GPU inteira); passou do limite dá OOM em vez de travar a máquina')
@@ -392,18 +393,32 @@ def main():
         model.add_callback(event, fn)
 
     kwargs = dict(data=args.data, epochs=args.max_epochs, imgsz=args.imgsz, batch=train_batch,
+                  project=str(root / 'runs' / 'detect'),   # sem isso o Ultralytics grava em <raiz do repo>/runs, fora do ia-service
                   device=device, name=args.run_name, exist_ok=True, patience=args.patience,
-                  cos_lr=True, freeze=args.freeze or None, close_mosaic=10,
-                  cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=resolve_workers(args.workers))
+                  cos_lr=True, freeze=None, close_mosaic=10,
+                  cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=resolve_workers(args.workers),
+                  amp=args.amp == 'on')
     if continuing:  # refinar modelo já treinado: LR baixo e warmup curto, p/ não "esquecer" o que já aprendeu
         kwargs.update(optimizer='AdamW', lr0=args.lr0 or 0.0005, warmup_epochs=1.0)
         print(f'🎯 Refinando modelo treinado: AdamW lr0={kwargs["lr0"]} (mude com --lr0)')
-    elif args.lr0:
-        kwargs['lr0'] = args.lr0
+    else:  # fine-tuning a partir de pesos pré-treinados (ex: COCO): LR alto desfaz o que o modelo já sabe (mAP caiu de 0.50 p/ 0.13 em 3 épocas)
+        kwargs.update(optimizer='AdamW', lr0=args.lr0 or 0.002, warmup_epochs=1.0)
+        print(f'🎯 Fine-tuning de pesos pré-treinados: AdamW lr0={kwargs["lr0"]} (mude com --lr0)')
+    freeze = args.freeze if args.freeze is not None else 10   # protege o backbone pré-treinado
+    kwargs['freeze'] = freeze or None
+    if freeze:
+        print(f'🧊 Congelando as {freeze} primeiras camadas (mude com --freeze; 0 desliga)')
     print(f'📅 {args.max_epochs} épocas pedidas · para antes se mAP50 ≥ {args.target_map:.2f} ou {args.patience} épocas sem melhorar')
-    model.train(**kwargs)
+    aborted = False
+    try:
+        model.train(**kwargs)
+    except KeyboardInterrupt:   # 2º sinal de parada (ex: durante a validação final): os pesos já estão salvos em weights/
+        aborted = True
+        print('🛑 abortado na validação final — os pesos do treino já estavam salvos')
     tr = model.trainer
     done, total = tr.epoch + 1, tr.epochs
+    if aborted:
+        STOP['asked'] = True   # cai no caminho "parado pelo usuário" abaixo
     reason = stop_reason(STOP['asked'], STOP['goal'], done, total)
     why = explain_stop(reason, done, total, args.patience, args.target_map)
     print(f'🏁 {why}')
@@ -412,7 +427,14 @@ def main():
     print('💾 ' + ' · '.join(f'{n} ' + (f'OK ({(wdir / n).stat().st_size / 1e6:.1f} MB)' if (wdir / n).exists() else 'NÃO GERADO')
                              for n in ('best.pt', 'last.pt')) + f'  em {wdir}')
     if STOP['asked']:  # parado pelo usuário: pesos já salvos pelo Ultralytics; pula validação/relatório (demoram)
-        print(f'🛑 treino parado. Pesos salvos em {wdir} (best.pt e last.pt)')
+        models_dir = root / 'models'
+        models_dir.mkdir(parents=True, exist_ok=True)
+        if (wdir / 'last.pt').exists():
+            shutil.copy2(wdir / 'last.pt', models_dir / 'last.pt')
+        if (wdir / 'best.pt').exists() and not best_pt.exists():   # nunca sobrescreve um best.pt já validado (sem mAP aqui p/ comparar)
+            shutil.copy2(wdir / 'best.pt', best_pt)
+            print('📦 models/best.pt criado a partir deste run (ainda não validado; make relatorio confere)')
+        print(f'🛑 treino parado. Pesos salvos em {wdir} (best.pt e last.pt) · cópia em models/last.pt')
         emit(args.events, type='stopped', path=str(wdir))
         return
 
