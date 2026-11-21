@@ -1,4 +1,4 @@
-path: /mnt/c/Users/teste/Sensus-2.0/apps/ia-service/datasets/coco_nav
+path: /home/idealab/Sensus-2.0/apps/ia-service/datasets/coco_nav
 train: images/train
 val: images/val
 nc: 10
