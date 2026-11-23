@@ -16,14 +16,18 @@ BATCH ?= 0
 RAM_GB ?= 0
 VRAM_GB ?= 0
 WORKERS ?= 0
+# DEVICE: auto | cpu | 0 | 0,1 | all  (várias GPUs = DDP; nesse modo painel/class-weights/alvo mAP não rodam, veja train.py)
+DEVICE ?= auto
+# Melhoria do dataset: TARGET_INST = instâncias por classe a atingir (0 = mediana das classes)
+TARGET_INST ?= 0
 # TUI: se a GPU chegar a MAX_TEMP °C (2 leituras seguidas) o treino é parado com segurança (salva best.pt/last.pt). 0 = desliga.
 MAX_TEMP ?= 85
 export MAX_TEMP
-MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB) --workers $(WORKERS)
+MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB) --workers $(WORKERS) --device $(DEVICE)
 PY = $(if $(wildcard .venv/bin/activate),. .venv/bin/activate && python3,python3)
 
 .DEFAULT_GOAL := help
-.PHONY: help instalar verificar tui painel dataset treinar train_coco coco relatorio publicar
+.PHONY: help instalar verificar tui painel dataset auditar melhorar melhorar_limpar treinar train_coco coco relatorio publicar
 
 help:
 	@echo "Sensus IA - comandos:"
@@ -32,7 +36,10 @@ help:
 	@echo "  make tui         - interface no terminal (inicia/para o treino, gráficos ao vivo)"
 	@echo "  make painel      - interface gráfica no navegador (http://127.0.0.1:8765)"
 	@echo "  make dataset     - baixa o COCO (10 classes) e balanceia (PER_CLASS=1000 VAL_PER_CLASS=200)"
-	@echo "  make treinar     - treina até TARGET de mAP50 (padrão 0.60); baixa o dataset se faltar"
+	@echo "  make auditar     - audita o dataset (corrompidas, duplicadas, vazamento train/val, balanço); não altera nada"
+	@echo "  make melhorar    - corrige o dataset (irrecuperável vai p/ _quarantine/) e balanceia classes raras com flip/rotação/luz/ruído. Ex: make melhorar TARGET_INST=1500"
+	@echo "  make melhorar_limpar - remove as imagens geradas por 'make melhorar'"
+	@echo "  make treinar     - treina até TARGET de mAP50 (padrão 0.60); baixa o dataset se faltar. Várias GPUs: make treinar DEVICE=0,1 (ou all)"
 	@echo "  make train_coco  - treino rápido (patience 15) com o dataset já pronto"
 	@echo "  make coco        - dataset + train_coco"
 	@echo "  make publicar    - sobe models/best.pt + relatório pro GitHub (commit só desses arquivos). Ex: make treinar publicar"
@@ -57,6 +64,15 @@ painel:
 dataset:
 	@echo "Baixando COCO (só as 10 classes) e balanceando: $(PER_CLASS) imgs/classe train, $(VAL_PER_CLASS) val"
 	$(PY) scripts/build_coco_dataset.py --per-class $(PER_CLASS) --val-per-class $(VAL_PER_CLASS)
+
+auditar:
+	$(PY) scripts/improve_dataset.py --data config/data.yaml
+
+melhorar:
+	$(PY) scripts/improve_dataset.py --data config/data.yaml --fix --balance --target $(TARGET_INST)
+
+melhorar_limpar:
+	$(PY) scripts/improve_dataset.py --data config/data.yaml --clean
 
 treinar:
 	@[ -d datasets/coco_nav/images/train ] || $(MAKE) dataset
