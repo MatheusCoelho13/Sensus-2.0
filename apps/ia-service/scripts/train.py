@@ -72,7 +72,7 @@ def parse_args():
     p.add_argument('--model', default=None, help='peso .pt inicial (ex: models/meu.pt). Sem ele: continua do models/best.pt ou usa yolov8s.pt')
     p.add_argument('--imgsz', type=int, default=768)
     p.add_argument('--batch', type=int, default=0, help='imagens por passo (0 = máximo: ocupa 90%% da VRAM; em CPU usa 16)')
-    p.add_argument('--device', default='auto')
+    p.add_argument('--device', default='auto', help="'auto', 'cpu', '0', ou várias GPUs: '0,1' / 'all' (DDP)")
     p.add_argument('--require-cuda', action='store_true')
     p.add_argument('--cls-weight', default='', help="'auto' ou lista 'w0,w1,...' (peso de erro por classe)")
     p.add_argument('--patience', type=int, default=30, help='épocas sem melhora antes de parar')
@@ -91,6 +91,11 @@ def parse_args():
 
 
 def select_device(arg_device: str, require_cuda: bool = False) -> str:
+    if arg_device and arg_device.lower() == 'all':
+        n = torch.cuda.device_count()
+        if not n:
+            raise RuntimeError('--device all: nenhuma GPU CUDA encontrada')
+        return ','.join(map(str, range(n)))
     if arg_device and arg_device != 'auto':
         return arg_device
     cuda = torch.cuda.is_available()
@@ -136,9 +141,23 @@ def pick_cache(cache: str, ram_gb: float, data_yaml: str, imgsz: int) -> str:
     return False
 
 
+def gpu_ids(device) -> list:
+    """'0,1' -> [0, 1]; '0' / 'cuda:1' -> [0] / [1]; 'cpu' -> []."""
+    if str(device) == 'cpu':
+        return []
+    ids = [int(t.split(':')[-1]) for t in str(device).split(',') if t.split(':')[-1].strip().isdigit()]
+    return ids or [0]
+
+
+def first_device(device) -> str:
+    """Treino em várias GPUs (DDP) usa todas; validação/relatório rodam numa só (a primeira)."""
+    ids = gpu_ids(device)
+    return str(ids[0]) if len(ids) > 1 else str(device)
+
+
 def cuda_index(device) -> int:
-    last = str(device).split(':')[-1]
-    return int(last) if last.isdigit() else 0
+    ids = gpu_ids(device)
+    return ids[0] if ids else 0
 
 
 def has_gpu(device) -> bool:
@@ -148,6 +167,14 @@ def has_gpu(device) -> bool:
 def resolve_batch(batch: int, device, vram_gb: float = 0):
     """(batch de treino, batch de validação). batch>0 é fixo. 0 = máximo: o Ultralytics aceita fração 0-1
     e dimensiona o batch p/ ocupar essa parte da VRAM (90%% da GPU, ou do limite --vram-gb). Em CPU: 16."""
+    n = len(gpu_ids(device))
+    if n > 1:   # DDP: o Ultralytics não dimensiona batch automático e exige batch inteiro divisível pelo nº de GPUs
+        total_batch = batch if batch > 0 else 16 * n
+        if total_batch % n:
+            total_batch += n - total_batch % n
+            print(f'⚠️ batch ajustado p/ {total_batch} (precisa ser múltiplo de {n} GPUs)')
+        print(f'🖥️ {n} GPUs (DDP): batch total {total_batch} = {total_batch // n} por GPU')
+        return total_batch, 16
     if batch > 0:
         return batch, batch
     if not has_gpu(device):
@@ -165,6 +192,9 @@ def resolve_workers(workers: int) -> int:
 
 def apply_vram_limit(device: str, gb: float):
     if not gb or not has_gpu(device):
+        return
+    if len(gpu_ids(device)) > 1:   # os processos DDP são novos: o limite deste processo não vale p/ eles
+        print('⚠️ --vram-gb é ignorado com várias GPUs (DDP); ajuste --batch p/ controlar a memória')
         return
     idx = cuda_index(device)
     total = torch.cuda.get_device_properties(idx).total_memory / 1e9
@@ -364,6 +394,16 @@ def main():
         signal.signal(sig, _ask_stop)
     device = select_device(args.device, args.require_cuda)
     print(f'Usando device: {device}')
+    multi = len(gpu_ids(device)) > 1
+    if multi:
+        have = torch.cuda.device_count()
+        if max(gpu_ids(device)) >= have:
+            raise RuntimeError(f'--device {device}: só há {have} GPU(s) CUDA')
+        print('⚠️ várias GPUs (DDP): o Ultralytics recria o treino em processos novos, então os callbacks deste script '
+              '(painel/events, class weights, parada por alvo mAP) NÃO rodam; patience e épocas continuam valendo.')
+        if args.cls_weight:
+            args.cls_weight = ''
+    val_dev = first_device(device)
     apply_vram_limit(device, args.vram_gb)
     train_batch, val_batch = resolve_batch(args.batch, device, args.vram_gb)
 
@@ -385,7 +425,7 @@ def main():
     best_pt = root / 'models' / 'best.pt'
     baseline = -1.0
     if best_pt.exists() and not args.skip_validate:   # revalida nos dados atuais: é o número a superar
-        baseline = validate(best_pt, args.data, args.imgsz, val_batch, device, args.fast_validate)
+        baseline = validate(best_pt, args.data, args.imgsz, val_batch, val_dev, args.fast_validate)
         print(f'📌 baseline mAP50 = {baseline:.3f}')
     seed = baseline if baseline >= 0 else (info or {}).get('map50')
     for event, fn in make_callbacks(args.target_map, cls_weights, args.events, baseline=seed,
@@ -442,7 +482,7 @@ def main():
     if not run_best.exists():
         print('⚠️ best.pt do run não encontrado — veja runs/detect')
         return
-    mm = val_metrics(run_best, args.data, args.imgsz, val_batch, device, args.fast_validate)
+    mm = val_metrics(run_best, args.data, args.imgsz, val_batch, val_dev, args.fast_validate)
     new = float(mm.box.map50)
     print(f'📈 mAP50 do run = {new:.3f} (baseline {baseline:.3f})')
     if new > baseline:
@@ -451,7 +491,7 @@ def main():
         print(f'📦 models/best.pt atualizado (mAP50={new:.3f})')
     try:  # relatório com matriz de confusão (geral e por classe); nunca derruba o fim do treino
         from report import write_report
-        rep = write_report(run_best, args.data, root / 'runs' / 'report', args.imgsz, val_batch, device, map_metrics=mm,
+        rep = write_report(run_best, args.data, root / 'runs' / 'report', args.imgsz, val_batch, val_dev, map_metrics=mm,
                            run_dir=Path(tr.save_dir))
         print(f'📄 Relatório com matriz de confusão: {rep}')
         emit(args.events, type='report', path=str(rep))
