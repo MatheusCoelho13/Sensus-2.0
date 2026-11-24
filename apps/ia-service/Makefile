@@ -23,17 +23,25 @@ TARGET_INST ?= 0
 # TUI: se a GPU chegar a MAX_TEMP °C (2 leituras seguidas) o treino é parado com segurança (salva best.pt/last.pt). 0 = desliga.
 MAX_TEMP ?= 85
 export MAX_TEMP
+# Câmera (make camera): ROTATE=180 gira a imagem (câmera de cabeça pra baixo; 0 desliga) | HEADLESS=1 roda sem janela | SPEAK=1 liga a voz
+ROTATE ?= 180
+HEADLESS ?= 0
+SPEAK ?= 0
+CAM_MODEL ?= $(if $(wildcard models/best.pt),models/best.pt,models/yolov8n.pt)
+# AUG_ROT: rotação no treino p/ variar o dataset: off | 15 | 30 | 180 (inclui imagem de cabeça pra baixo)
+AUG_ROT ?= off
 MEM = --batch $(BATCH) --ram-gb $(RAM_GB) --vram-gb $(VRAM_GB) --workers $(WORKERS) --device $(DEVICE)
 PY = $(if $(wildcard .venv/bin/activate),. .venv/bin/activate && python3,python3)
 
 .DEFAULT_GOAL := help
-.PHONY: help instalar verificar tui painel dataset auditar melhorar melhorar_limpar treinar train_coco coco relatorio publicar
+.PHONY: help instalar verificar tui camera painel dataset auditar melhorar melhorar_limpar treinar train_coco coco relatorio publicar
 
 help:
 	@echo "Sensus IA - comandos:"
 	@echo "  make instalar    - cria o venv e instala tudo que precisa (make instalar CPU=1 = torch leve, só CPU) e confere no fim"
 	@echo "  make verificar   - confere se o ambiente está pronto (pacotes, GPU, modelos, dataset)"
 	@echo "  make tui         - interface no terminal (inicia/para o treino, gráficos ao vivo)"
+	@echo "  make camera      - detecção na webcam. ROTATE=180 (padrão; 0 desliga) HEADLESS=1 (sem janela) SPEAK=1 (voz). Ex: make camera HEADLESS=1"
 	@echo "  make painel      - interface gráfica no navegador (http://127.0.0.1:8765)"
 	@echo "  make dataset     - baixa o COCO (10 classes) e balanceia (PER_CLASS=1000 VAL_PER_CLASS=200)"
 	@echo "  make auditar     - audita o dataset (corrompidas, duplicadas, vazamento train/val, balanço); não altera nada"
@@ -47,6 +55,7 @@ help:
 	@echo "  resolução: IMGSZ=640 (padrão; 960 p/ objetos pequenos, usa mais VRAM)  Ex: make treinar IMGSZ=960 BATCH=4"
 	@echo "  parada: EPOCHS=300 PATIENCE=30 TARGET=0.60  (para quando acabam as épocas, ou mAP50 >= TARGET, ou PATIENCE épocas sem melhorar)"
 	@echo "  segurança: a TUI para o treino se a GPU chegar a MAX_TEMP=85 °C (0 desliga). Ex: make tui MAX_TEMP=80"
+	@echo "  rotação: AUG_ROT=off|15|30|180 gira as imagens no treino (180 = inclui de cabeça pra baixo; na TUI: tecla g). Ex: make treinar AUG_ROT=180"
 	@echo "  recursos (0 = máximo, padrão): BATCH= RAM_GB= VRAM_GB= WORKERS=   Ex: make treinar VRAM_GB=4 BATCH=8"
 
 instalar:
@@ -57,6 +66,9 @@ verificar:
 
 tui:
 	$(PY) scripts/train_tui.py
+
+camera:
+	$(PY) scripts/detect_and_speak.py webcam --model $(CAM_MODEL) --rotate $(ROTATE) $(if $(filter 1,$(HEADLESS)),--headless) $(if $(filter 1,$(SPEAK)),--speak)
 
 painel:
 	$(PY) scripts/train_ui.py
@@ -77,10 +89,10 @@ melhorar_limpar:
 treinar:
 	@[ -d datasets/coco_nav/images/train ] || $(MAKE) dataset
 	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz $(IMGSZ) $(MEM) \
-		--cls-weight auto --max-epochs $(EPOCHS) --patience $(PATIENCE) --target-map $(TARGET)
+		--cls-weight auto --rotate $(AUG_ROT) --max-epochs $(EPOCHS) --patience $(PATIENCE) --target-map $(TARGET)
 
 train_coco:
-	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz $(IMGSZ) $(MEM) --cls-weight auto --max-epochs $(EPOCHS) --patience 15
+	$(PY) scripts/train.py --data config/data.yaml --model $(MODEL) --imgsz $(IMGSZ) $(MEM) --cls-weight auto --rotate $(AUG_ROT) --max-epochs $(EPOCHS) --patience 15
 
 coco: dataset train_coco
 

@@ -4,7 +4,7 @@
   make tui
 
 Mesmo motor do painel web (scripts/train_ui.py): sobe o train.py, lê runs/ui/events.jsonl.
-Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · z imgsz · p patience · a LR · f freeze · b batch · r RAM · v VRAM · u AMP · c cache · w workers · m modelo · o relatório · l log
+Teclas: s iniciar/parar · +/- alvo mAP50 · e épocas · z imgsz · p patience · a LR · f freeze · b batch · r RAM · v VRAM · u AMP · c cache · w workers · g rotação · m modelo · o relatório · l log
         t sensores (CPU/RAM/GPU/temperaturas, estilo btop) · T abre o btop de verdade · q sair (para o treino)
 """
 import curses
@@ -30,7 +30,7 @@ GLYPH = {
     '.': ['  ', '  ', '  ', '██', '██'],
 }
 EIGHTHS = ' ▁▂▃▄▅▆▇█'
-CONFIG_KEYS = {ord(c) for c in 'eEbBrRvVmMzZpPaAfFuUcCwW+=-_'}
+CONFIG_KEYS = {ord(c) for c in 'eEbBrRvVmMzZpPaAfFuUcCwWgG+=-_'}
 HELP = [
     ('ÉPOCAS (tecla e)', 'Quantas vezes a rede vê o conjunto de treino inteiro. Mais épocas = mais aprendizado e mais tempo. '
                          'É um LIMITE: o treino pode parar antes (veja "quando para").'),
@@ -50,6 +50,8 @@ HELP = [
     ('AMP (u)', 'Precisão mista (fp16): mais rápido e usa menos VRAM. Em algumas GTX 16xx dá loss nan — se acontecer, desligue (off).'),
     ('CACHE (c)', 'ram = imagens decodificadas na memória (mais rápido; só liga se couber no limite de RAM) · disk = em disco · off = sem cache.'),
     ('WORKERS (w)', 'Processos que carregam e aumentam as imagens enquanto a GPU treina. "máx" = todas as threads da CPU. Se a GPU ficar ociosa, aumente.'),
+    ('ROTAÇÃO (g)', 'Gira as imagens durante o treino p/ variar o dataset sem criar arquivos. 15/30 = giro aleatório de até ±N°. '
+                    '180 = também mostra imagens de cabeça pra baixo (celular/câmera invertida) além de giros leves.'),
     ('MODELO (m)', 'Ponto de partida. best.pt = continua do melhor treino já feito e tenta melhorar (taxa de aprendizado baixa).'),
     ('▲ RECOMPENSA / ▼ PUNIÇÃO', 'O mAP50 subiu / caiu em relação à época anterior. A rede corrige os pesos a partir do erro (loss) '
                                  'contra os rótulos: é aprendizado supervisionado.'),
@@ -63,6 +65,7 @@ RAM_CHOICES = [0, 2, 4, 8, 16, 32]       # GB p/ cache de imagens; 0 = máximo (
 VRAM_CHOICES = [0, 2, 3, 4, 6, 8, 12]    # GB de GPU; 0 = máximo (a GPU inteira)
 AMP_CHOICES = ['on', 'off']
 CACHE_CHOICES = ['ram', 'disk', 'false']
+ROT_CHOICES = ['off', '15', '30', '180']   # giro das imagens no treino (aumenta o dataset)
 WORKERS_CHOICES = [0, 2, 4, 6, 8, 12]    # 0 = máximo (todas as threads da CPU)
 
 INK, REWARD, PUNISH, DIM, L1, L2, L3 = range(1, 8)
@@ -142,7 +145,7 @@ class UI:
         self.ask, self.busy, self.was_running, self.msg_pair = None, None, False, PUNISH   # ask: 'report' | 'publish' | None
         self.target, self.epochs, self.model = 0.60, 300, ''
         self.batch_i, self.ram_i, self.vram_i = 0, 0, 0
-        self.amp_i, self.cache_i, self.workers_i = 0, 0, 0
+        self.amp_i, self.cache_i, self.workers_i, self.rot_i = 0, 0, 0, 0
         self.imgsz_i, self.lr_i, self.freeze_i, self.patience = 0, 0, 0, core.DEFAULT_PATIENCE
         self.quitting = False
         self.S, self.last_poll, self.pairs = {'running': False, 'events': [], 'log': [], 'dataset_ready': True, 'models': [], 'report_ready': False, 'files': [],
@@ -334,7 +337,7 @@ class UI:
                             'vram_gb': VRAM_CHOICES[self.vram_i], 'imgsz': IMGSZ_CHOICES[self.imgsz_i],
                             'patience': self.patience, 'lr0': LR_CHOICES[self.lr_i], 'freeze': FREEZE_CHOICES[self.freeze_i],
                             'amp': AMP_CHOICES[self.amp_i], 'cache': CACHE_CHOICES[self.cache_i],
-                            'workers': WORKERS_CHOICES[self.workers_i]})
+                            'workers': WORKERS_CHOICES[self.workers_i], 'rotate': ROT_CHOICES[self.rot_i]})
                 self.msg = ''
         except ValueError as e:
             self.say(f'erro: {e}')
@@ -395,6 +398,8 @@ class UI:
             self.cache_i = (self.cache_i + 1) % len(CACHE_CHOICES)
         elif k in (ord('w'), ord('W')):
             self.workers_i = (self.workers_i + 1) % len(WORKERS_CHOICES)
+        elif k in (ord('g'), ord('G')):
+            self.rot_i = (self.rot_i + 1) % len(ROT_CHOICES)
         elif k in (ord('o'), ord('O')):
             if core.REPORT.exists():
                 import webbrowser
@@ -523,7 +528,7 @@ class UI:
         lr, fr = LR_CHOICES[self.lr_i], FREEZE_CHOICES[self.freeze_i]
         self.put(8, 2, f'imgsz {IMGSZ_CHOICES[self.imgsz_i]} · patience {self.patience} · LR {lr if lr else "auto"} · freeze {fr if fr >= 0 else "auto"}', DIM)
         wk = WORKERS_CHOICES[self.workers_i]
-        self.put(9, 2, f'AMP {AMP_CHOICES[self.amp_i]} · cache {CACHE_CHOICES[self.cache_i].replace("false", "off")} · workers {wk or "máx"}', DIM)
+        self.put(9, 2, f'AMP {AMP_CHOICES[self.amp_i]} · cache {CACHE_CHOICES[self.cache_i].replace("false", "off")} · workers {wk or "máx"} · rotação {ROT_CHOICES[self.rot_i].replace("180", "180° (invertida)")}', DIM)
 
         # régua até o alvo
         bw = min(w - 6, 70)
@@ -722,7 +727,7 @@ class UI:
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 1, ban[: w - 3], bp)
         info = (f'? ajuda · s {"parar" if self.S["running"] else "iniciar"} · +/- alvo {self.target:.2f} · e épocas · z imgsz · p patience · a LR · f freeze · b batch · r RAM · '
-                f'v VRAM · u AMP · c cache · w workers · m modelo · i imagens · o relatório · t sensores · T btop · l {"voltar" if self.show_log else "log"} · q sair')
+                f'v VRAM · u AMP · c cache · w workers · g rotação · m modelo · i imagens · o relatório · t sensores · T btop · l {"voltar" if self.show_log else "log"} · q sair')
         self.put(h - 1, 1, info, DIM)
 
     def help_view(self):

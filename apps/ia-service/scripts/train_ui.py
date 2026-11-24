@@ -116,6 +116,7 @@ def validate(body: dict) -> dict:
                 vram_gb=num('vram_gb', float, 0, 256, 0), model=model,
                 lr0=num('lr0', float, 0, 0.1, 0), freeze=num('freeze', int, -1, 100, -1),
                 workers=num('workers', int, 0, 64, 0), amp='off' if str(body.get('amp', 'on')) == 'off' else 'on',
+                rotate=str(body.get('rotate', 'off')) if str(body.get('rotate', 'off')) in ('off', '15', '30', '180') else 'off',
                 cache=str(body.get('cache', 'ram')) if str(body.get('cache', 'ram')) in ('ram', 'disk', 'false') else 'ram')   # lr0 0 e freeze -1 = automático (train.py decide)
 
 
@@ -132,7 +133,7 @@ def start(body: dict):
                  '--batch', str(a['batch']), '--cls-weight', 'auto', '--max-epochs', str(a['epochs']),
                  '--patience', str(a['patience']), '--target-map', str(a['target']), '--events', str(EVENTS),
                  '--ram-gb', str(a['ram_gb']), '--vram-gb', str(a['vram_gb']),
-                 '--workers', str(a['workers']), '--amp', a['amp'], '--cache', a['cache']]
+                 '--workers', str(a['workers']), '--amp', a['amp'], '--cache', a['cache'], '--rotate', a['rotate']]
         if a['lr0'] > 0:
             train += ['--lr0', str(a['lr0'])]
         if a['freeze'] >= 0:

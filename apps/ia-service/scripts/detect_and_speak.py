@@ -154,12 +154,12 @@ def analyze_image(image_path, model_path='models/yolov8n.pt', output_dir='output
     return detections
 
 
-def analyze_file_or_camera(source, model_path='models/yolov8n.pt', output_dir='output', speak_enabled=False):
+def analyze_file_or_camera(source, model_path='models/yolov8n.pt', output_dir='output', speak_enabled=False, rotate=0, headless=False):
     """Analisa arquivo, URL ou câmera com áudio."""
     
     if source.lower() in ('webcam', '0', 'camera'):
         print("📷 Abrindo câmera com detecção de objetos...")
-        print("Pressione 'q' para sair\n")
+        print("Ctrl+C para sair\n" if headless else "Pressione 'q' para sair\n")
         
         cap = cv2.VideoCapture(0)
         model = YOLO(model_path)
@@ -172,8 +172,11 @@ def analyze_file_or_camera(source, model_path='models/yolov8n.pt', output_dir='o
             if not ret:
                 break
             
+            if rotate == 180:  # câmera montada de cabeça pra baixo
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+            
             # Detecção
-            results = model(frame)
+            results = model(frame, verbose=not headless)
             r = results[0]
             
             h, w = frame.shape[:2]
@@ -234,16 +237,19 @@ def analyze_file_or_camera(source, model_path='models/yolov8n.pt', output_dir='o
             cv2.putText(frame, info_text, (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
-            cv2.imshow('Detecção de Objetos 🎥', frame)
-            
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
+            if headless:
+                if frame_objects:
+                    print(f"[{frame_count}] {', '.join(sorted(set(frame_objects)))}", flush=True)
+            else:
+                cv2.imshow('Detecção de Objetos 🎥', frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
             
             frame_count += 1
         
         cap.release()
-        cv2.destroyAllWindows()
+        if not headless:
+            cv2.destroyAllWindows()
     
     elif source.startswith('http://') or source.startswith('https://'):
         print(f"🌐 Baixando imagem: {source}")
@@ -272,6 +278,14 @@ if __name__ == '__main__':
     parser.add_argument('--speak', action='store_true',
                        help='Ativar síntese de voz (TTS)')
     
+    parser.add_argument('--rotate', type=int, choices=(0, 180), default=0,
+                       help='Girar a imagem da câmera (180 = câmera de cabeça pra baixo)')
+    parser.add_argument('--headless', action='store_true',
+                       help='Sem janela (sem UI): imprime as detecções no terminal; Ctrl+C sai')
+    
     args = parser.parse_args()
     
-    analyze_file_or_camera(args.source, args.model, args.output, args.speak)
+    try:
+        analyze_file_or_camera(args.source, args.model, args.output, args.speak, args.rotate, args.headless)
+    except KeyboardInterrupt:
+        pass

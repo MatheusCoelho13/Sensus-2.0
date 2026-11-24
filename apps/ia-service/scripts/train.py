@@ -80,6 +80,8 @@ def parse_args():
     p.add_argument('--lr0', type=float, default=None, help='learning rate inicial (default: automático)')
     p.add_argument('--cache', default='ram', choices=['ram', 'disk', 'false'], help='cache das imagens (ram = mais rápido)')
     p.add_argument('--amp', default='on', choices=['on', 'off'], help='precisão mista (mais rápido). Em algumas GTX 16xx dá loss nan: use off')
+    p.add_argument('--rotate', default='off', choices=['off', '15', '30', '180'],
+                   help="rotação no treino p/ variar o dataset: 15/30 = giro aleatório ±N°; 180 = também de cabeça pra baixo (flipud 50%% + fliplr 50%% = 180° exato em 25%%)")
     p.add_argument('--workers', type=int, default=0, help='processos de data loading (0 = máximo: todos os núcleos da CPU)')
     p.add_argument('--ram-gb', type=float, default=0, help='limite de RAM p/ o cache de imagens em GB (0 = máximo: toda a RAM livre)')
     p.add_argument('--vram-gb', type=float, default=0, help='limite de VRAM do processo em GB (0 = máximo: a GPU inteira); passou do limite dá OOM em vez de travar a máquina')
@@ -438,6 +440,12 @@ def main():
                   cos_lr=True, freeze=None, close_mosaic=10,
                   cache=pick_cache(args.cache, args.ram_gb, args.data, args.imgsz), workers=resolve_workers(args.workers),
                   amp=args.amp == 'on')
+    if args.rotate == '180':
+        kwargs.update(flipud=0.5, degrees=10)
+    elif args.rotate != 'off':
+        kwargs.update(degrees=float(args.rotate))
+    if args.rotate != 'off':
+        print(f'🔄 Rotação no treino: {args.rotate}')
     if continuing:  # refinar modelo já treinado: LR baixo e warmup curto, p/ não "esquecer" o que já aprendeu
         kwargs.update(optimizer='AdamW', lr0=args.lr0 or 0.0005, warmup_epochs=1.0)
         print(f'🎯 Refinando modelo treinado: AdamW lr0={kwargs["lr0"]} (mude com --lr0)')
