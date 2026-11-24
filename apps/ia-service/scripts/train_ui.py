@@ -111,7 +111,10 @@ def validate(body: dict) -> dict:
     model = str(body.get('model', 'models/yolov8n.pt'))
     if not re.fullmatch(r'[\w ./-]+\.pt', model) or '..' in model or model.startswith('/'):
         raise ValueError('model deve ser um caminho relativo .pt (ex: models/yolov8n.pt)')
-    return dict(target=num('target', float, 0.05, 0.99, 0.6), epochs=num('max_epochs', int, 1, 1000, 300),
+    device = str(body.get('device', 'auto'))
+    if not re.fullmatch(r'auto|cpu|all|\d+(,\d+)*', device):
+        raise ValueError('device deve ser auto, cpu, all ou índices (ex: 0 ou 0,1)')
+    return dict(device=device, target=num('target', float, 0.05, 0.99, 0.6), epochs=num('max_epochs', int, 1, 1000, 300),
                 imgsz=num('imgsz', int, 320, 1280, 640), batch=num('batch', int, 0, 128, 0), ram_gb=num('ram_gb', float, 0, 1024, 0), patience=num('patience', int, 1, 1000, DEFAULT_PATIENCE),
                 vram_gb=num('vram_gb', float, 0, 256, 0), model=model,
                 lr0=num('lr0', float, 0, 0.1, 0), freeze=num('freeze', int, -1, 100, -1),
@@ -133,7 +136,7 @@ def start(body: dict):
                  '--batch', str(a['batch']), '--cls-weight', 'auto', '--max-epochs', str(a['epochs']),
                  '--patience', str(a['patience']), '--target-map', str(a['target']), '--events', str(EVENTS),
                  '--ram-gb', str(a['ram_gb']), '--vram-gb', str(a['vram_gb']),
-                 '--workers', str(a['workers']), '--amp', a['amp'], '--cache', a['cache'], '--rotate', a['rotate']]
+                 '--workers', str(a['workers']), '--amp', a['amp'], '--cache', a['cache'], '--rotate', a['rotate'], '--device', a['device']]
         if a['lr0'] > 0:
             train += ['--lr0', str(a['lr0'])]
         if a['freeze'] >= 0:
