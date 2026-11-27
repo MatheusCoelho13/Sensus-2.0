@@ -45,7 +45,7 @@ const DIRECTION_PHRASE: Record<NonNullable<Direction>, string> = {
  * Examples:
  *   "Atenção! Pessoa à esquerda, muito próxima"
  *   "Mesa à frente, à distância média"
- *   "Cadeira à direita detectada"
+ *   "Cadeira à direita detectada ao longe"
  */
 export function buildDirectionalMessage(obj: ObjetoDetectado): string {
   const label = ptOf(obj.nome)
@@ -54,5 +54,5 @@ export function buildDirectionalMessage(obj: ObjetoDetectado): string {
 
   if (obj.isClose) return `Atenção! ${label}${dirPhrase}, muito próxima`
   if (obj.distancia === 'medio') return `${label}${dirPhrase}, à distância média`
-  return `${label}${dirPhrase} detectada`
+  return `${label}${dirPhrase} detectada ao longe`
 }

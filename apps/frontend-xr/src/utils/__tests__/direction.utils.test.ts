@@ -141,6 +141,10 @@ describe('buildDirectionalMessage', () => {
   })
 
   describe('longe (isClose=false)', () => {
+    it('says "ao longe" so the user hears the distance', () => {
+      expect(buildDirectionalMessage(mkObj('cell phone', 'longe', 0.4, 0.2))).toContain('ao longe')
+    })
+
     it('includes "detectada"', () => {
       const msg = buildDirectionalMessage(mkObj('cell phone', 'longe', 0.4, 0.2))
       expect(msg).toContain('detectada')
