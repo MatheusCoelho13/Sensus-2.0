@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CameraView } from '../components/CameraView'
-import { StatusIndicator } from '../components/StatusIndicator'
 import { ConnectionGuard } from '../components/ConnectionGuard'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useFrameSender } from '../hooks/useFrameSender'
@@ -20,36 +19,38 @@ function isWebSocketError(data: unknown): data is WebSocketError {
 
 const ptLabel: Record<string, string> = {
   person: 'pessoa', bicycle: 'bicicleta', car: 'carro', motorcycle: 'moto',
-  bus: 'onibus', train: 'trem', truck: 'caminhao', boat: 'barco',
+  bus: 'ônibus', train: 'trem', truck: 'caminhão', boat: 'barco',
   bench: 'banco', cat: 'gato', dog: 'cachorro', backpack: 'mochila',
-  bottle: 'garrafa', cup: 'xicara', fork: 'garfo', knife: 'faca',
-  banana: 'banana', apple: 'maca', sandwich: 'sanduiche', orange: 'laranja',
+  bottle: 'garrafa', cup: 'xícara', fork: 'garfo', knife: 'faca',
+  banana: 'banana', apple: 'maçã', sandwich: 'sanduíche', orange: 'laranja',
   pizza: 'pizza', donut: 'rosquinha', cake: 'bolo', chair: 'cadeira',
-  couch: 'sofa', bed: 'cama', toilet: 'vaso', tv: 'tv',
+  couch: 'sofá', bed: 'cama', toilet: 'vaso', tv: 'tv',
   laptop: 'notebook', mouse: 'mouse', remote: 'controle', keyboard: 'teclado',
   'cell phone': 'celular', sink: 'pia', refrigerator: 'geladeira',
-  book: 'livro', clock: 'relogio', scissors: 'tesoura', toothbrush: 'escova',
+  book: 'livro', clock: 'relógio', scissors: 'tesoura', toothbrush: 'escova',
 }
 const ptOf = (l: string) => ptLabel[l.toLowerCase()] || l
 
-const BUCKET: Record<string, string> = {
-  person: 'person', pessoa: 'person',
-  car: 'vehicle', carro: 'vehicle', truck: 'vehicle', bus: 'vehicle', motorcycle: 'vehicle',
-  bicycle: 'vehicle', boat: 'vehicle',
-  chair: 'furniture', cadeira: 'furniture', couch: 'furniture', sofa: 'furniture',
-  bed: 'furniture', mesa: 'furniture',
-  tv: 'electronic', laptop: 'electronic', notebook: 'electronic',
-  mouse: 'electronic', keyboard: 'electronic', remote: 'electronic',
-  'cell phone': 'electronic', celular: 'electronic', controle: 'electronic',
-  banana: 'food', apple: 'food', pizza: 'food', orange: 'food',
+// A distância é o que importa para quem se desloca, então ela (e não a categoria) dá a cor.
+type Dist = 'perto' | 'medio' | 'longe'
+const DISTS: Dist[] = ['perto', 'medio', 'longe']
+const DIST_TEXT: Record<Dist, string> = { perto: 'perto', medio: 'médio', longe: 'longe' }
+const distOf = (o: ObjetoDetectado): Dist => (o.isClose ? 'perto' : o.distancia ?? 'longe')
+
+// Canvas não lê CSS vars: manter em sincronia com --signal / --fg / --bg em globals.css.
+const DIST: Record<Dist, { stroke: string; fill: string; w: number; dash: number[]; tabBg: string; tabFg: string }> = {
+  perto: { stroke: '#FFC800', fill: 'transparent', w: 3, dash: [], tabBg: '#FFC800', tabFg: '#15140F' },
+  medio: { stroke: '#F2EFE6', fill: 'transparent', w: 2, dash: [], tabBg: '#0F0F0D', tabFg: '#F2EFE6' },
+  longe: { stroke: 'rgba(242,239,230,0.7)', fill: 'transparent', w: 1.5, dash: [6, 5], tabBg: '#0F0F0D', tabFg: '#F2EFE6' },
 }
-const CAT_COLOR: Record<string, string> = {
-  person: 'var(--info)', vehicle: 'var(--danger)',
-  furniture: 'var(--accent)', electronic: 'var(--info)',
-  food: 'var(--ok)', default: 'var(--accent)',
+
+function groupByDist(objs: ObjetoDetectado[]) {
+  return DISTS.map(d => ({ d, objs: objs.filter(o => distOf(o) === d) }))
 }
-function colorOf(nome: string) {
-  return CAT_COLOR[BUCKET[nome.toLowerCase()] ?? 'default'] ?? CAT_COLOR.default
+function tally(objs: ObjetoDetectado[]) {
+  const m = new Map<string, number>()
+  objs.forEach(o => m.set(o.nome, (m.get(o.nome) ?? 0) + 1))
+  return [...m].map(([n, c]) => (c > 1 ? `${ptOf(n)} ×${c}` : ptOf(n))).join(', ')
 }
 
 const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -62,42 +63,16 @@ function useLocalState<T>(key: string, initial: T): [T, React.Dispatch<React.Set
   useEffect(() => { try { localStorage.setItem(key, JSON.stringify(v)) } catch {} }, [key, v])
   return [v, setV]
 }
-const Icon = ({ d, size = 16, stroke = 1.6 }: { d: any; size?: number; stroke?: number }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={stroke} strokeLinecap="round" strokeLinejoin="round">{d}</svg>
-)
-const ICONS = {
-  live: <><circle cx="12" cy="12" r="3"/><path d="M5.05 5.05a10 10 0 0 0 0 13.9M18.95 5.05a10 10 0 0 1 0 13.9M8.46 8.46a5 5 0 0 0 0 7.07M15.54 8.46a5 5 0 0 1 0 7.07"/></>,
-  sessions: <><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></>,
-  gallery: <><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 16l5-5 4 4 3-3 6 6"/><circle cx="9" cy="9" r="1.5"/></>,
-  settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></>,
-  xr: <><path d="M2 12h4l2-4h8l2 4h4v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/><circle cx="8.5" cy="14.5" r="1.5"/><circle cx="15.5" cy="14.5" r="1.5"/></>,
-  play: <><polygon points="5 3 19 12 5 21 5 3"/></>,
-  stop: <><rect x="5" y="5" width="14" height="14" rx="1"/></>,
-  shot: <><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></>,
-  trash: <><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></>,
-  download: <><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></>,
-  expand: <><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></>,
-}
 
-function Mark({ size = 22 }: { size?: number }) {
+// Três barras que encurtam: a régua de distância é o logo.
+function Mark({ size = 24 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-      <circle cx="12" cy="12" r="10.5" stroke="currentColor" strokeWidth="0.8" opacity="0.5"/>
-      <circle cx="12" cy="12" r="6" stroke="currentColor" strokeWidth="0.8"/>
-      <circle cx="12" cy="12" r="2.2" fill="var(--accent)"/>
-      <line x1="12" y1="0.5" x2="12" y2="3" stroke="currentColor" strokeWidth="0.8"/>
-      <line x1="12" y1="21" x2="12" y2="23.5" stroke="currentColor" strokeWidth="0.8"/>
-      <line x1="0.5" y1="12" x2="3" y2="12" stroke="currentColor" strokeWidth="0.8"/>
-      <line x1="21" y1="12" x2="23.5" y2="12" stroke="currentColor" strokeWidth="0.8"/>
+    <svg width={size} height={size * 0.75} viewBox="0 0 24 18" aria-hidden="true">
+      <rect x="1" y="1" width="22" height="4" fill="#FFC800" stroke="currentColor" strokeWidth="1.5"/>
+      <rect x="0" y="7" width="15" height="4" fill="currentColor"/>
+      <rect x="0" y="14" width="8" height="4" fill="currentColor"/>
     </svg>
   )
-}
-
-const ghostBtn: React.CSSProperties = {
-  display: 'inline-flex', alignItems: 'center', gap: 8,
-  padding: '10px 14px', borderRadius: 8,
-  border: '1px solid var(--line)', background: 'transparent',
-  color: 'var(--fg)', fontSize: 13, cursor: 'pointer', fontFamily: 'inherit',
 }
 
 function getBbox(obj: ObjetoDetectado) {
@@ -113,6 +88,7 @@ function drawBboxes(
   canvas: HTMLCanvasElement,
   objetos: ObjetoDetectado[],
   showLabels: boolean,
+  showDistance: boolean,
   video?: HTMLVideoElement | null,
 ) {
   const ctx = canvas.getContext('2d')
@@ -125,269 +101,147 @@ function drawBboxes(
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   ctx.clearRect(0, 0, cw, ch)
 
-  // The video uses object-fit:contain so there may be letterbox/pillarbox bars.
-  // Compute the active video area inside the canvas so bbox coords map correctly.
+  // O vídeo usa object-fit:cover (preenche o palco e corta o excesso).
+  // Mesma escala do CSS, com offset negativo no eixo cortado, para a caixa cair sobre o objeto.
   const vw = video?.videoWidth || cw, vh = video?.videoHeight || ch
-  const scale = Math.min(cw / vw, ch / vh)
+  const scale = Math.max(cw / vw, ch / vh)
   const activeW = vw * scale, activeH = vh * scale
   const offsetX = (cw - activeW) / 2, offsetY = (ch - activeH) / 2
 
-  objetos.forEach(obj => {
+  // longe primeiro, perto por último: o que está perto nunca fica coberto.
+  const ordered = [...objetos].sort((a, b) => DISTS.indexOf(distOf(b)) - DISTS.indexOf(distOf(a)))
+  ordered.forEach(obj => {
     const { x, y, w, h } = getBbox(obj)
     if (x == null || w == null || h == null) return
-    
+
     const rx = offsetX + x * activeW
     const ry = offsetY + y * activeH
     const rw = w * activeW
     const rh = h * activeH
-    
-    const color = colorOf(obj.nome)
-    const t = 10
-    ctx.strokeStyle = color; ctx.lineWidth = 1.5
+    const d = distOf(obj)
+    const st = DIST[d]
+
+    ctx.fillStyle = st.fill
+    ctx.fillRect(rx, ry, rw, rh)
+    ctx.strokeStyle = st.stroke
+    ctx.lineWidth = st.w
+    ctx.setLineDash(st.dash)
     ctx.strokeRect(rx, ry, rw, rh)
-    ctx.lineWidth = 2.5
-    ctx.beginPath()
-    ctx.moveTo(rx, ry + t); ctx.lineTo(rx, ry); ctx.lineTo(rx + t, ry)
-    ctx.moveTo(rx + rw - t, ry); ctx.lineTo(rx + rw, ry); ctx.lineTo(rx + rw, ry + t)
-    ctx.moveTo(rx, ry + rh - t); ctx.lineTo(rx, ry + rh); ctx.lineTo(rx + t, ry + rh)
-    ctx.moveTo(rx + rw - t, ry + rh); ctx.lineTo(rx + rw, ry + rh); ctx.lineTo(rx + rw, ry + rh - t)
-    ctx.stroke()
+    ctx.setLineDash([])
+
     if (showLabels) {
-      const label = ptOf(obj.nome)
-      ctx.font = "500 11px 'Geist Mono', monospace"
+      const label = showDistance ? `${ptOf(obj.nome)} · ${DIST_TEXT[d]}` : ptOf(obj.nome)
+      ctx.font = "700 15px 'Atkinson Hyperlegible Next', system-ui, sans-serif"
       const tw = ctx.measureText(label).width
-      ctx.fillStyle = color
-      ctx.fillRect(rx - 0.75, ry - 18, tw + 12, 18)
-      ctx.fillStyle = '#ffffff'
-      ctx.fillText(label, rx + 5, ry - 5)
+      const th = 24
+      const ty = ry - th >= 0 ? ry - th : ry // sem espaço acima: a etiqueta entra na caixa
+      ctx.fillStyle = st.tabBg
+      ctx.fillRect(rx, ty, tw + 14, th)
+      ctx.fillStyle = st.tabFg
+      ctx.textBaseline = 'middle'
+      ctx.fillText(label, rx + 7, ty + th / 2 + 1)
     }
   })
 }
-function Sidebar({ view, setView, onXR, sessions, wsState }: any) {
+
+const CONN_TEXT = { OPEN: 'Conectado', CONNECTING: 'Conectando…', CLOSED: 'Sem conexão' } as const
+
+// Equivale ao que a voz diz: o grupo mais próximo, em letra grande.
+function Caption({ objetos, online }: { objetos: ObjetoDetectado[]; online: boolean }) {
+  const near = groupByDist(objetos).find(g => g.objs.length)
+  const rest = near ? objetos.length - near.objs.length : 0
+  return (
+    <div className="caption">
+      {near ? (
+        <>
+          <span className="tag" data-d={near.d}>{DIST_TEXT[near.d]}</span>
+          <span className="caption-text">{tally(near.objs)}</span>
+          {rest > 0 && <span className="more">+{rest} além</span>}
+        </>
+      ) : (
+        <span className="caption-text dim">{online ? 'Nada à vista.' : 'Aguardando conexão…'}</span>
+      )}
+    </div>
+  )
+}
+
+function Header({ view, setView, onXR, sessions, wsState }: any) {
   const items = [
-    { id: 'live', label: 'Live', icon: ICONS.live, hint: 'tempo real' },
-    { id: 'sessions', label: 'Sessoes', icon: ICONS.sessions, hint: `${sessions.length} salvas` },
-    { id: 'gallery', label: 'Galeria', icon: ICONS.gallery, hint: 'snapshots' },
-    { id: 'settings', label: 'Configuracoes', icon: ICONS.settings, hint: 'ajustes' },
+    { id: 'live', label: 'Ao vivo' },
+    { id: 'sessions', label: 'Sessões', n: sessions.length },
+    { id: 'gallery', label: 'Galeria' },
+    { id: 'settings', label: 'Ajustes' },
   ]
   return (
-    <aside style={{
-      borderRight: '1px solid var(--line)', background: 'var(--bg-2)',
-      display: 'flex', flexDirection: 'column', padding: '16px 12px', gap: 8, width: 232, flexShrink: 0,
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 8px 16px' }}>
-        <Mark size={22}/>
-        <div>
-          <div style={{ fontSize: 14, fontWeight: 500, letterSpacing: '-0.01em' }}>Sensus</div>
-          <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 9.5, color: 'var(--fg-3)', letterSpacing: '0.06em' }}>v0.4 - BETA</div>
-        </div>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+    <>
+      <div className="brand"><Mark size={26}/> Sensus</div>
+      <nav className="nav" aria-label="Principal">
         {items.map(it => (
-          <button key={it.id} onClick={() => setView(it.id)} style={{
-            display: 'flex', alignItems: 'center', gap: 11,
-            padding: '9px 10px', borderRadius: 8, border: 'none',
-            background: view === it.id ? 'var(--bg-3)' : 'transparent',
-            color: view === it.id ? 'var(--fg)' : 'var(--fg-2)',
-            textAlign: 'left', fontSize: 13.5, cursor: 'pointer', fontFamily: 'inherit',
-          }}>
-            <span style={{ color: view === it.id ? 'var(--accent)' : 'var(--fg-3)' }}>
-              <Icon d={it.icon} size={16}/>
-            </span>
-            <span style={{ flex: 1 }}>{it.label}</span>
-            <span style={{ fontFamily: 'Geist Mono, monospace', fontSize: 10, color: 'var(--fg-3)' }}>{it.hint}</span>
+          <button key={it.id} onClick={() => setView(it.id)} aria-current={view === it.id ? 'page' : undefined}>
+            {it.label}{it.n ? <span className="n">{it.n}</span> : null}
           </button>
         ))}
-      </div>
-      <div style={{ height: 1, background: 'var(--line-2)', margin: '12px 8px' }}/>
-      <button onClick={onXR} style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '10px 12px', borderRadius: 8,
-        border: '1px solid var(--line)', background: 'transparent',
-        color: 'var(--fg)', fontSize: 13.5, cursor: 'pointer', fontFamily: 'inherit',
-      }}>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ color: 'var(--accent)' }}><Icon d={ICONS.xr} size={16}/></span>
-          Modo XR
-        </span>
-        <span style={{ color: 'var(--fg-3)' }}><Icon d={ICONS.expand} size={12}/></span>
-      </button>
-      <div style={{ marginTop: 'auto' }}>
-        <div style={{
-          padding: 12, borderRadius: 8, background: 'var(--bg-3)',
-          border: '1px solid var(--line)', display: 'flex', flexDirection: 'column', gap: 6,
-        }}>
-          <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 9.5, color: 'var(--fg-3)', letterSpacing: '0.08em' }}>BACKEND</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--fg-2)' }}>
-            <span style={{
-              width: 7, height: 7, borderRadius: '50%',
-              background: wsState === 'OPEN' ? 'var(--ok)' : wsState === 'CONNECTING' ? 'var(--accent)' : 'var(--danger)',
-              boxShadow: wsState === 'OPEN' ? '0 0 0 3px color-mix(in oklab, var(--ok) 25%, transparent)' : 'none',
-            }}/>
-            {wsState === 'OPEN' ? 'conectado' : wsState === 'CONNECTING' ? 'conectando...' : 'desconectado'}
-          </div>
-          <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 10, color: 'var(--fg-3)' }}>YOLOv8 - Spring</div>
-        </div>
-      </div>
-    </aside>
+        <button className="xr" onClick={onXR}>Modo XR</button>
+      </nav>
+      <div className="conn" data-s={wsState} role="status"><i/>{CONN_TEXT[wsState as keyof typeof CONN_TEXT]}</div>
+    </>
   )
 }
 
-function TopBar({ view }: { view: string }) {
-  const titles: Record<string, [string, string]> = {
-    live: ['Captura ao vivo', 'feed da camera + inferencia em tempo real'],
-    sessions: ['Sessoes', 'historico de analises'],
-    gallery: ['Galeria', 'snapshots capturados'],
-    settings: ['Configuracoes', 'modelo, sensibilidade e narracao'],
-  }
-  const [title, sub] = titles[view] ?? titles.live
+function Page({ title, lede, children }: { title: string; lede: string; children: React.ReactNode }) {
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      padding: '16px 24px', borderBottom: '1px solid var(--line)', background: 'var(--bg)',
-    }}>
-      <div>
-        <div style={{ fontSize: 16, fontWeight: 500, letterSpacing: '-0.01em' }}>{title}</div>
-        <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 11, color: 'var(--fg-3)', letterSpacing: '0.04em', marginTop: 2 }}>{sub}</div>
-      </div>
+    <div className="page">
+      <h1>{title}</h1>
+      <p className="lede">{lede}</p>
+      {children}
     </div>
   )
 }
 
-function Empty({ msg, sub }: { msg: string; sub: string }) {
-  return (
-    <div style={{
-      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-      gap: 6, padding: '40px 20px', textAlign: 'center', color: 'var(--fg-3)',
-    }}>
-      <div style={{ fontSize: 13.5, color: 'var(--fg-2)' }}>{msg}</div>
-      <div style={{ fontSize: 12 }}>{sub}</div>
-    </div>
-  )
+function Empty({ title, sub }: { title: string; sub: string }) {
+  return <div className="empty">{title}<p>{sub}</p></div>
 }
 
-function EmptyState({ title, sub }: { title: string; sub: string }) {
-  return (
-    <div style={{
-      padding: '80px 20px', textAlign: 'center',
-      border: '1px dashed var(--line)', borderRadius: 14, background: 'var(--bg-2)',
-      display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
-    }}>
-      <div style={{ fontSize: 17, fontWeight: 500, color: 'var(--fg)' }}>{title}</div>
-      <div style={{ fontSize: 13, color: 'var(--fg-3)', maxWidth: 380 }}>{sub}</div>
-    </div>
-  )
-}
-function Inspector({ analise, history, wsState }: { analise: AnaliseResponse | null; history: any[]; wsState: string }) {
-  const [tab, setTab] = useState('now')
+function Ruler({ analise, history, wsState }: { analise: AnaliseResponse | null; history: any[]; wsState: string }) {
   const objetos = analise?.objetos ?? []
-  const grouped = Object.entries(
-    objetos.reduce((acc: any, o) => { acc[o.nome] = (acc[o.nome] || 0) + 1; return acc }, {})
-  ).sort((a: any, b: any) => b[1] - a[1])
-
+  const groups = groupByDist(objetos)
   return (
-    <aside style={{
-      width: 340, flexShrink: 0, borderLeft: '1px solid var(--line)',
-      display: 'flex', flexDirection: 'column', background: 'var(--bg-2)', minHeight: 0,
-    }}>
-      <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid var(--line-2)' }}>
-        <span style={{
-          width: 7, height: 7, borderRadius: '50%',
-          background: wsState === 'OPEN' ? 'var(--ok)' : 'var(--fg-3)',
-          boxShadow: wsState === 'OPEN' ? '0 0 0 3px color-mix(in oklab, var(--ok) 25%, transparent)' : 'none',
-        }}/>
-        <span style={{ fontFamily: 'Geist Mono, monospace', fontSize: 11.5, color: 'var(--fg-2)' }}>
-          {wsState === 'OPEN' ? `${objetos.length} objeto(s) detectado(s)` : 'Aguardando conexao...'}
-        </span>
+    <aside className="ruler" aria-label="Detecções por distância">
+      <div className="ruler-head">
+        <span className="eyebrow">Régua</span>
+        <span>{wsState === 'OPEN' ? `${objetos.length} à vista` : 'sem conexão'}</span>
       </div>
-      <div style={{ display: 'flex', padding: '10px 14px 0', gap: 4 }}>
-        {([['now', 'Agora', objetos.length], ['history', 'Historico', history.length]] as any[]).map(([id, label, count]) => (
-          <button key={id} onClick={() => setTab(id)} style={{
-            padding: '8px 12px', borderRadius: 6,
-            background: tab === id ? 'var(--bg-3)' : 'transparent',
-            color: tab === id ? 'var(--fg)' : 'var(--fg-3)',
-            border: 'none', fontSize: 12, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit',
-            display: 'flex', alignItems: 'center', gap: 6,
-          }}>
-            {label}
-            <span style={{
-              fontFamily: 'Geist Mono, monospace', fontSize: 10, padding: '1px 5px', borderRadius: 3,
-              background: tab === id ? 'var(--bg-4)' : 'var(--bg-3)', color: 'var(--fg-3)',
-            }}>{count}</span>
-          </button>
+      <ol className="bands">
+        {groups.map(({ d, objs }) => (
+          <li key={d} className="band" data-d={d} data-on={objs.length > 0}>
+            <span className="band-name">{DIST_TEXT[d]}</span>
+            {objs.length ? (
+              <>
+                <span className="band-n">{objs.length}</span>
+                <span className="band-what">{tally(objs)}</span>
+              </>
+            ) : <span className="band-none">livre</span>}
+          </li>
         ))}
-      </div>
-      <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 18px' }}>
-        {tab === 'now' && (
-          objetos.length === 0
-            ? <Empty msg="Nenhum objeto detectado" sub="Aguardando deteccoes do backend." />
-            : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                <div>
-                  <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 10, color: 'var(--fg-3)', letterSpacing: '0.1em', marginBottom: 8 }}>RESUMO</div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                    {grouped.map(([label, count]: any) => (
-                      <span key={label} style={{
-                        fontSize: 11.5, padding: '4px 9px', borderRadius: 100,
-                        border: `1px solid ${colorOf(label)}40`,
-                        background: `${colorOf(label)}15`,
-                        color: 'var(--fg)',
-                        display: 'inline-flex', alignItems: 'center', gap: 5,
-                      }}>
-                        <span style={{ width: 6, height: 6, borderRadius: '50%', background: colorOf(label) }}/>
-                        {ptOf(label)} <span style={{ color: 'var(--fg-3)' }}>{count}</span>
-                      </span>
-                    ))}
-                  </div>
-                </div>
-                <div style={{ height: 1, background: 'var(--line-2)' }}/>
-                <div>
-                  <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 10, color: 'var(--fg-3)', letterSpacing: '0.1em', marginBottom: 8 }}>DETECCOES</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    {objetos.map((obj, i) => (
-                      <div key={i} style={{
-                        display: 'grid', gridTemplateColumns: '8px 1fr auto',
-                        gap: 9, alignItems: 'center', padding: '7px 0', fontSize: 12.5,
-                        borderBottom: '1px solid var(--line-2)',
-                      }}>
-                        <span style={{ width: 6, height: 6, borderRadius: 1, background: colorOf(obj.nome) }}/>
-                        <span style={{ color: 'var(--fg)' }}>{ptOf(obj.nome)}</span>
-                        <span style={{ fontFamily: 'Geist Mono, monospace', fontSize: 10.5, color: obj.isClose ? 'var(--danger)' : 'var(--fg-3)' }}>
-                          {obj.distancia}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )
-        )}
-        {tab === 'history' && (
-          history.length === 0
-            ? <Empty msg="Historico vazio" sub="Eventos aparecerão aqui." />
-            : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                {history.slice(0, 80).map((d: any, i: number) => (
-                  <div key={i} style={{
-                    display: 'grid', gridTemplateColumns: 'auto 1fr auto',
-                    gap: 10, padding: '8px 0', fontSize: 12,
-                    borderBottom: '1px solid var(--line-2)',
-                  }}>
-                    <span style={{ fontFamily: 'Geist Mono, monospace', color: 'var(--fg-3)', fontSize: 10.5 }}>{fmtTime(d.ts)}</span>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, color: 'var(--fg)' }}>
-                      <span style={{ width: 6, height: 6, borderRadius: 1, background: colorOf(d.nome) }}/>
-                      {ptOf(d.nome)}
-                    </span>
-                    <span style={{ fontFamily: 'Geist Mono, monospace', color: 'var(--fg-3)', fontSize: 10.5 }}>{d.distancia}</span>
-                  </div>
-                ))}
-              </div>
-            )
-        )}
-      </div>
+      </ol>
+      <div className="ruler-head"><span className="eyebrow">Registro</span></div>
+      {history.length === 0 ? (
+        <p className="log-empty">Entra aqui quando um objeto novo aparece ou muda de distância.</p>
+      ) : (
+        <ul className="log">
+          {history.slice(0, 12).map((e: any, i: number) => (
+            <li key={i}>
+              <time>{fmtTime(e.ts)}</time>
+              <span>{ptOf(e.nome)}</span>
+              <span className="d" data-d={distOf(e)}>{DIST_TEXT[distOf(e)]}</span>
+            </li>
+          ))}
+        </ul>
+      )}
     </aside>
   )
 }
+
 function LiveView({ analise, history, addSnapshot, settings, wsState }: any) {
   const { wsState: ws } = useWebSocket()
   const [video, setVideo] = useState<HTMLVideoElement | null>(null)
@@ -397,8 +251,8 @@ function LiveView({ analise, history, addSnapshot, settings, wsState }: any) {
 
   useEffect(() => {
     if (!canvasRef.current || !analise) return
-    drawBboxes(canvasRef.current, analise.objetos, settings.showLabels, video)
-  }, [analise, settings.showLabels, video])
+    drawBboxes(canvasRef.current, analise.objetos, settings.showLabels, settings.showDistance, video)
+  }, [analise, settings.showLabels, settings.showDistance, video])
 
   const takeSnapshot = useCallback(() => {
     if (!video) return
@@ -415,63 +269,19 @@ function LiveView({ analise, history, addSnapshot, settings, wsState }: any) {
   }, [video, analise, addSnapshot])
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', height: '100%', minHeight: 0 }}>
-      <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
-        <div style={{
-          position: 'relative', flex: 1, minHeight: 0,
-          borderRadius: 14, overflow: 'hidden',
-          background: 'var(--bg-2)', border: '1px solid var(--line)',
-          boxShadow: '0 20px 60px -20px rgba(0,0,0,0.5)',
-        }}>
-          <ConnectionGuard wsState={wsState}>
-            <CameraView onVideoReady={setVideo} />
-            <canvas ref={canvasRef} style={{
-              position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 10,
-            }}/>
-          </ConnectionGuard>
-          {wsState === 'OPEN' && (
-            <>
-              <div style={{
-                position: 'absolute', left: 16, top: 16, zIndex: 20,
-                display: 'flex', alignItems: 'center', gap: 8,
-                padding: '6px 10px', borderRadius: 6,
-                background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
-              }}>
-                <span style={{ width: 7, height: 7, borderRadius: 1, background: 'var(--danger)', animation: 'rec 1.2s ease-in-out infinite' }}/>
-                <span style={{ fontFamily: 'Geist Mono, monospace', fontSize: 11, letterSpacing: '0.06em' }}>REC - LIVE</span>
-              </div>
-              <div style={{
-                position: 'absolute', right: 16, top: 16, zIndex: 20,
-                padding: '6px 10px', borderRadius: 6,
-                background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
-                fontFamily: 'Geist Mono, monospace', fontSize: 10.5,
-                display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-end',
-              }}>
-                <span>{analise?.objetos.length ?? 0} objetos</span>
-                <span style={{ color: 'var(--fg-3)' }}>YOLOv8 - ativo</span>
-              </div>
-              <div style={{
-                position: 'absolute', left: '50%', top: '50%', width: 22, height: 22,
-                transform: 'translate(-50%, -50%)', pointerEvents: 'none', zIndex: 20,
-              }}>
-                <div style={{ position: 'absolute', left: 0, right: 0, top: '50%', height: 1, background: 'rgba(255,255,255,0.5)' }}/>
-                <div style={{ position: 'absolute', top: 0, bottom: 0, left: '50%', width: 1, background: 'rgba(255,255,255,0.5)' }}/>
-              </div>
-            </>
-          )}
-        </div>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 8,
-          padding: '10px 14px', borderRadius: 12,
-          background: 'var(--bg-2)', border: '1px solid var(--line)',
-        }}>
-          <button onClick={takeSnapshot} disabled={wsState !== 'OPEN'} style={ghostBtn}>
-            <Icon d={ICONS.shot} size={13}/> Snapshot
-          </button>
+    <div className="live">
+      <h1 className="sr-only">Ao vivo</h1>
+      <div className="stage">
+        <ConnectionGuard wsState={wsState}>
+          <CameraView onVideoReady={setVideo} />
+          <canvas ref={canvasRef} aria-hidden="true"/>
+        </ConnectionGuard>
+        <div className="foot">
+          <Caption objetos={analise?.objetos ?? []} online={wsState === 'OPEN'}/>
+          <button className="shutter" onClick={takeSnapshot} disabled={wsState !== 'OPEN'}>Capturar</button>
         </div>
       </div>
-      <Inspector analise={analise} history={history} wsState={wsState}/>
-      <style>{`@keyframes rec{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
+      <Ruler analise={analise} history={history} wsState={wsState}/>
     </div>
   )
 }
@@ -479,114 +289,76 @@ function LiveView({ analise, history, addSnapshot, settings, wsState }: any) {
 function SessionsView({ sessions, setSessions }: any) {
   const remove = (id: string) => setSessions(sessions.filter((s: any) => s.id !== id))
   return (
-    <div style={{ padding: 24 }}>
+    <Page title="Sessões" lede="Cada captura feita ao vivo, com o que estava à vista naquele momento.">
       {sessions.length === 0 ? (
-        <EmptyState title="Nenhuma sessao salva" sub="Capture snapshots na tela Live para que aparecam aqui." />
+        <Empty title="Nada registrado ainda." sub="Use Capturar na tela Ao vivo." />
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <ul className="rows">
           {sessions.map((s: any) => (
-            <div key={s.id} style={{
-              padding: 20, borderRadius: 12,
-              border: '1px solid var(--line)', background: 'var(--bg-2)',
-              display: 'grid', gridTemplateColumns: '1fr auto', gap: 16,
-            }}>
-              <div>
-                <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 6 }}>{fmtDate(s.ts)}</div>
-                <div style={{ fontSize: 12.5, color: 'var(--fg-3)', fontFamily: 'Geist Mono, monospace' }}>
-                  {s.objetos?.length ?? 0} objetos detectados
-                </div>
-              </div>
-              <button onClick={() => remove(s.id)} style={{ ...ghostBtn, padding: '6px 10px', color: 'var(--fg-3)' }}>
-                <Icon d={ICONS.trash} size={12}/>
-              </button>
-            </div>
+            <li key={s.id}>
+              <span className="when">{fmtDate(s.ts)}</span>
+              <span className="what">{s.objetos?.length ? tally(s.objetos) : 'nada à vista'}</span>
+              <button className="btn danger" onClick={() => remove(s.id)} aria-label={`Excluir sessão de ${fmtDate(s.ts)}`}>Excluir</button>
+            </li>
           ))}
-        </div>
+        </ul>
       )}
-    </div>
+    </Page>
   )
 }
 
 function GalleryView({ snapshots, setSnapshots }: any) {
   const [sel, setSel] = useState<any>(null)
   const remove = (id: string) => setSnapshots(snapshots.filter((s: any) => s.id !== id))
+  useEffect(() => {
+    if (!sel) return
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') setSel(null) }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [sel])
   return (
-    <div style={{ padding: 24 }}>
+    <Page title="Galeria" lede="Os quadros que você capturou, guardados só neste aparelho.">
       {snapshots.length === 0 ? (
-        <EmptyState title="Galeria vazia" sub="Capture snapshots durante a captura para ve-los aqui." />
+        <Empty title="Galeria vazia." sub="Capturas feitas ao vivo aparecem aqui." />
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 14 }}>
+        <div className="grid">
           {snapshots.map((s: any) => (
-            <div key={s.id} onClick={() => setSel(s)} style={{
-              borderRadius: 10, overflow: 'hidden',
-              border: '1px solid var(--line)', background: 'var(--bg-2)', cursor: 'pointer',
-            }}>
-              <img src={s.thumb} alt="snapshot" style={{ width: '100%', aspectRatio: '16/10', objectFit: 'cover', display: 'block' }}/>
-              <div style={{ padding: '10px 12px' }}>
-                <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 10.5, color: 'var(--fg-3)', marginBottom: 4 }}>{fmtDate(s.ts)}</div>
-                <div style={{ fontSize: 12, color: 'var(--fg-2)' }}>
-                  {s.objetos?.length ?? 0} objetos
-                </div>
-              </div>
-            </div>
+            <button key={s.id} className="shot" onClick={() => setSel(s)}>
+              <img src={s.thumb} alt={`Captura de ${fmtDate(s.ts)}, ${s.objetos?.length ?? 0} objetos`}/>
+              <span><b>{fmtDate(s.ts)}</b><span>{s.objetos?.length ?? 0} obj.</span></span>
+            </button>
           ))}
         </div>
       )}
       {sel && (
-        <div onClick={() => setSel(null)} style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: 40,
-        }}>
-          <div onClick={(e: any) => e.stopPropagation()} style={{
-            maxWidth: 900, width: '100%', borderRadius: 14,
-            background: 'var(--bg-2)', border: '1px solid var(--line)', overflow: 'hidden',
-          }}>
-            <img src={sel.thumb} style={{ width: '100%', display: 'block' }} alt="snapshot"/>
-            <div style={{ padding: 18, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ fontFamily: 'Geist Mono, monospace', fontSize: 11, color: 'var(--fg-3)' }}>{fmtDate(sel.ts)}</div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <a href={sel.thumb} download={`sensus-${sel.id}.jpg`} style={{ ...ghostBtn, textDecoration: 'none' }}>
-                  <Icon d={ICONS.download} size={13}/> Baixar
-                </a>
-                <button onClick={() => { remove(sel.id); setSel(null) }} style={{ ...ghostBtn, color: 'var(--danger)' }}>
-                  <Icon d={ICONS.trash} size={13}/> Excluir
-                </button>
+        <div className="modal" onClick={() => setSel(null)}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-label="Captura ampliada" onClick={(e: any) => e.stopPropagation()}>
+            <img src={sel.thumb} alt={`Captura de ${fmtDate(sel.ts)}`}/>
+            <div className="modal-foot">
+              <b>{fmtDate(sel.ts)}</b>
+              <div>
+                <a className="btn" href={sel.thumb} download={`sensus-${sel.id}.jpg`}>Baixar</a>
+                <button className="btn danger" onClick={() => { remove(sel.id); setSel(null) }}>Excluir</button>
+                <button className="btn" onClick={() => setSel(null)} autoFocus>Fechar</button>
               </div>
             </div>
           </div>
         </div>
       )}
-    </div>
+    </Page>
   )
 }
 
-function Toggle({ label, value, onChange }: any) {
+function Switch({ label, hint, value, onChange }: { label: string; hint: string; value: boolean; onChange: (v: boolean) => void }) {
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: 16, alignItems: 'center' }}>
-      <label style={{ fontSize: 13, color: 'var(--fg-2)' }}>{label}</label>
-      <button onClick={() => onChange(!value)} style={{
-        width: 38, height: 22, borderRadius: 100, border: 'none', padding: 2,
-        background: value ? 'var(--accent)' : 'var(--bg-4)',
-        position: 'relative', cursor: 'pointer',
-      }}>
-        <span style={{
-          position: 'absolute', top: 2, left: value ? 18 : 2,
-          width: 18, height: 18, borderRadius: '50%',
-          background: 'var(--fg)', transition: 'left .15s',
-        }}/>
-      </button>
-    </div>
-  )
-}
-
-function Section({ title, sub, children }: any) {
-  return (
-    <div style={{ marginBottom: 28, paddingBottom: 28, borderBottom: '1px solid var(--line-2)' }}>
-      <div style={{ marginBottom: 18 }}>
-        <h3 style={{ fontSize: 16, fontWeight: 500, margin: '0 0 4px', letterSpacing: '-0.01em' }}>{title}</h3>
-        {sub && <p style={{ fontSize: 12.5, color: 'var(--fg-3)', margin: 0 }}>{sub}</p>}
+    <div className="row">
+      <div>
+        <div className="row-label">{label}</div>
+        <div className="row-hint">{hint}</div>
       </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>{children}</div>
+      <button className="switch" role="switch" aria-checked={value} aria-label={label} onClick={() => onChange(!value)}>
+        {value ? 'Ligado' : 'Desligado'}
+      </button>
     </div>
   )
 }
@@ -594,81 +366,49 @@ function Section({ title, sub, children }: any) {
 function SettingsView({ settings, setSettings }: any) {
   const set = (k: string, v: any) => setSettings({ ...settings, [k]: v })
   return (
-    <div style={{ padding: 24, maxWidth: 720 }}>
-      <Section title="Visualizacao" sub="Como as deteccoes aparecem sobre o feed.">
-        <Toggle label="Mostrar rotulos" value={settings.showLabels} onChange={(v: boolean) => set('showLabels', v)} />
-        <Toggle label="Mostrar distancia" value={settings.showDistance} onChange={(v: boolean) => set('showDistance', v)} />
-      </Section>
-      <Section title="Narracao em audio (TTS)" sub="O Sensus pode descrever o ambiente em voz alta.">
-        <Toggle label="Ativar narracao" value={settings.ttsEnabled} onChange={(v: boolean) => set('ttsEnabled', v)} />
-      </Section>
-      <Section title="Sobre" sub={null}>
-        <div style={{ fontSize: 13, color: 'var(--fg-2)', lineHeight: 1.6 }}>
-          Sensus v0.4 - build 2026.05<br/>
-          Camada de percepcao espacial para dispositivos XR.<br/>
-          <span style={{ fontFamily: 'Geist Mono, monospace', fontSize: 11.5, color: 'var(--fg-3)' }}>
-            Projeto desenvolvido na disciplina de Solucoes Web.
-          </span>
-        </div>
-      </Section>
-    </div>
+    <Page title="Ajustes" lede="O que aparece na tela e o que o Sensus fala em voz alta.">
+      <section className="sect">
+        <h2>Na tela</h2>
+        <Switch label="Nome do objeto" hint="Etiqueta em cada caixa desenhada sobre a imagem." value={settings.showLabels} onChange={v => set('showLabels', v)} />
+        <Switch label="Distância na etiqueta" hint="Acrescenta perto, médio ou longe ao nome." value={settings.showDistance} onChange={v => set('showDistance', v)} />
+      </section>
+      <section className="sect">
+        <h2>Na voz</h2>
+        <Switch label="Narração" hint="Descreve o ambiente em voz alta, do mais próximo ao mais distante." value={settings.ttsEnabled} onChange={v => set('ttsEnabled', v)} />
+      </section>
+      <section className="sect">
+        <h2>Sobre</h2>
+        <p className="about">Sensus é uma camada de percepção espacial para quem enxerga pouco ou usa dispositivos XR. Projeto da disciplina de Oficina de IA.</p>
+      </section>
+    </Page>
   )
 }
 
-function XRView({ onExit, analise, wsState }: any) {
+function XRView({ onExit, analise, wsState, settings }: any) {
   const { wsState: ws } = useWebSocket()
   const [video, setVideo] = useState<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   useFrameSender(video, ws === 'OPEN')
   useEffect(() => {
     if (!canvasRef.current || !analise) return
-    drawBboxes(canvasRef.current, analise.objetos, true, video)
-  }, [analise, video])
+    drawBboxes(canvasRef.current, analise.objetos, true, settings.showDistance, video)
+  }, [analise, video, settings.showDistance])
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onExit() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [onExit])
   return (
-    <div style={{ position: 'fixed', inset: 0, background: '#000', zIndex: 1000 }}>
+    <div className="xr-view">
       <ConnectionGuard wsState={wsState}>
         <CameraView onVideoReady={setVideo}/>
-        <canvas ref={canvasRef} style={{
-          position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 10,
-        }}/>
+        <canvas ref={canvasRef} aria-hidden="true"/>
       </ConnectionGuard>
-      <div style={{
-        position: 'absolute', left: 24, top: 24, zIndex: 20,
-        display: 'inline-flex', alignItems: 'center', gap: 9,
-        padding: '8px 14px', borderRadius: 8,
-        background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(12px)',
-        border: '1px solid rgba(255,255,255,0.1)',
-      }}>
-        <Mark size={18}/>
-        <span style={{ fontSize: 13, fontWeight: 500, color: '#fff' }}>SENSUS XR</span>
-        <span style={{ fontFamily: 'Geist Mono, monospace', fontSize: 10, color: 'rgba(255,255,255,0.5)', letterSpacing: '0.08em' }}>IMERSIVO</span>
+      <div className="xr-brand"><Mark size={22}/> Sensus XR</div>
+      <div className="foot">
+        <Caption objetos={analise?.objetos ?? []} online={wsState === 'OPEN'}/>
+        <button className="exit" onClick={onExit}>Sair · Esc</button>
       </div>
-      <div style={{
-        position: 'absolute', right: 24, top: 24, zIndex: 20,
-        padding: '10px 14px', borderRadius: 8,
-        background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(12px)',
-        border: '1px solid rgba(255,255,255,0.1)',
-        fontFamily: 'Geist Mono, monospace', fontSize: 11, color: '#fff',
-        display: 'flex', flexDirection: 'column', gap: 3, alignItems: 'flex-end',
-      }}>
-        <span>{analise?.objetos.length ?? 0} objetos</span>
-        <span style={{ opacity: 0.6 }}>YOLOv8 - {wsState === 'OPEN' ? 'ativo' : 'offline'}</span>
-      </div>
-      <button onClick={onExit} style={{
-        position: 'absolute', left: '50%', bottom: 32, transform: 'translateX(-50%)', zIndex: 20,
-        padding: '12px 20px', borderRadius: 100,
-        background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(12px)',
-        border: '1px solid rgba(255,255,255,0.15)',
-        color: '#fff', fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 8,
-        cursor: 'pointer', fontFamily: 'inherit',
-      }}>
-        <Icon d={ICONS.expand} size={13}/> Sair do modo XR (esc)
-      </button>
     </div>
   )
 }
@@ -689,9 +429,11 @@ export function App() {
 
   const seenRef = useRef<Map<string, number>>(new Map())
   const addHistory = useCallback((evt: any) => {
-    const last = seenRef.current.get(evt.nome) ?? 0
-    if (Date.now() - last < 3000) return
-    seenRef.current.set(evt.nome, Date.now())
+    // Registra quando algo muda (objeto novo ou outra distância), não a cada quadro.
+    const key = `${evt.nome}|${distOf(evt)}`
+    const last = seenRef.current.get(key) ?? 0
+    if (Date.now() - last < 15000) return
+    seenRef.current.set(key, Date.now())
     setHistory(h => [evt, ...h].slice(0, 200))
   }, [])
 
@@ -719,11 +461,11 @@ export function App() {
     return () => webSocketService.offMessage(handler)
   }, [addHistory, announce, settings])
 
-  if (xrMode) return <XRView onExit={() => setXrMode(false)} analise={analise} wsState={wsState}/>
+  if (xrMode) return <XRView onExit={() => setXrMode(false)} analise={analise} wsState={wsState} settings={settings}/>
 
   return (
-    <div style={{ display: 'flex', height: '100vh', background: 'var(--bg)', overflow: 'hidden' }}>
-      <Sidebar view={view} setView={setView} onXR={() => {
+    <div className="app">
+      <Header view={view} setView={setView} sessions={sessions} wsState={wsState} onXR={() => {
         if (typeof window !== 'undefined' && window.speechSynthesis) {
           // Desbloqueia o Autoplay Policy do navegador enviando um áudio mudo
           const u = new SpeechSynthesisUtterance('');
@@ -731,17 +473,13 @@ export function App() {
           window.speechSynthesis.speak(u);
         }
         setXrMode(true);
-      }} sessions={sessions} wsState={wsState}/>
-      <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
-        <TopBar view={view}/>
-        <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-          {view === 'live' && <LiveView analise={analise} history={history} addSnapshot={addSnapshot} settings={settings} wsState={wsState}/>}
-          {view === 'sessions' && <SessionsView sessions={sessions} setSessions={setSessions}/>}
-          {view === 'gallery' && <GalleryView snapshots={snapshots} setSnapshots={setSnapshots}/>}
-          {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings}/>}
-        </div>
-      </div>
-      <StatusIndicator wsState={wsState}/>
+      }}/>
+      <main className="main">
+        {view === 'live' && <LiveView analise={analise} history={history} addSnapshot={addSnapshot} settings={settings} wsState={wsState}/>}
+        {view === 'sessions' && <SessionsView sessions={sessions} setSessions={setSessions}/>}
+        {view === 'gallery' && <GalleryView snapshots={snapshots} setSnapshots={setSnapshots}/>}
+        {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings}/>}
+      </main>
     </div>
   )
 }
